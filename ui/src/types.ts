@@ -48,7 +48,13 @@ export type ServerEvent =
   | { type: "detections"; objects: DetectedObject[]; ts: number }
   | { type: "calibration_updated"; calibration: Calibration }
   | { type: "calibration_prompt"; markers: CalibrationMarker[] }
-  | { type: "calibration_captured"; detected_marker_ids: number[] }
+  | {
+      type: "calibration_captured";
+      detected_marker_ids: number[];
+      detected_corners_cam: [number, number][][];
+      frame_width: number;
+      frame_height: number;
+    }
   | { type: "projector_registered"; proj_width: number; proj_height: number }
   | { type: "work_surface_updated"; work_surface: WorkSurface; show_outline: boolean }
   | { type: "camera_changed"; camera_index: number | null; camera_open: boolean; error: string | null };

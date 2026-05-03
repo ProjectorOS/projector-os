@@ -39,12 +39,21 @@ interface PendingMargins {
   bottom: string;
 }
 
+interface CalibrationDiagnostic {
+  detectedIds: number[];
+  detectedCorners: [number, number][][];
+  frameWidth: number;
+  frameHeight: number;
+  lastSeenAt: number;
+}
+
 interface ViewState {
   mode: Mode;
   connection: "connecting" | "open" | "closed";
   calibration: Calibration | null;
   projector: [number, number] | null;
   capturedMarkers: number;
+  calibDiag: CalibrationDiagnostic | null;
   detections: DetectedObject[];
   lastDetectionTs: number | null;
   displays: Display[];
@@ -70,6 +79,7 @@ class ControlApp {
     calibration: null,
     projector: null,
     capturedMarkers: 0,
+    calibDiag: null,
     detections: [],
     lastDetectionTs: null,
     displays: [],
@@ -90,6 +100,12 @@ class ControlApp {
   // While the user is dragging a work-surface edge, suppress full re-renders so the
   // SVG handles and pointer state stay alive. Updates apply directly via DOM refs.
   private draggingEdge: "top" | "bottom" | "left" | "right" | null = null;
+  // Persistent <img> for the camera MJPEG preview. Re-used across renders so we don't
+  // tear down and reopen the long-lived multipart HTTP connection on every event.
+  private cameraPreviewImg: HTMLImageElement | null = null;
+  // UI prefs persisted to localStorage (per browser).
+  private workSurfaceCollapsed = readBool("workSurfaceCollapsed", false);
+  private previewRotation: 0 | 180 = readNumber("previewRotation", 0) === 180 ? 180 : 0;
 
   constructor(private readonly root: HTMLElement) {
     this.ws = new WsClient({
@@ -126,16 +142,27 @@ class ControlApp {
         break;
       case "mode_changed":
         this.state.mode = ev.mode;
-        if (ev.mode !== "calibrate") this.state.capturedMarkers = 0;
+        if (ev.mode !== "calibrate") {
+          this.state.capturedMarkers = 0;
+          this.state.calibDiag = null;
+        }
         break;
       case "calibration_updated":
         this.state.calibration = ev.calibration;
         break;
       case "calibration_prompt":
         this.state.capturedMarkers = 0;
+        this.state.calibDiag = null;
         break;
       case "calibration_captured":
         this.state.capturedMarkers = ev.detected_marker_ids.length;
+        this.state.calibDiag = {
+          detectedIds: ev.detected_marker_ids,
+          detectedCorners: ev.detected_corners_cam,
+          frameWidth: ev.frame_width,
+          frameHeight: ev.frame_height,
+          lastSeenAt: Date.now(),
+        };
         break;
       case "projector_registered":
         this.state.projector = [ev.proj_width, ev.proj_height];
@@ -368,10 +395,31 @@ class ControlApp {
 
   private renderWorkSurfaceCard(): HTMLElement {
     const card = el("div", "card");
-    card.appendChild(el("h2", "", "Work surface"));
 
     const proj = this.state.projector!;
     const ws = this.state.workSurface;
+    const collapsed = this.workSurfaceCollapsed;
+
+    // Clickable header that toggles collapse. Shows a summary on the right when collapsed.
+    const header = el("div", "card-header");
+    const title = el("h2", "", "Work surface");
+    header.appendChild(title);
+    if (collapsed) {
+      const summary = el("span", "card-summary");
+      summary.textContent = ws ? `${ws.width} × ${ws.height}` : "—";
+      header.appendChild(summary);
+    }
+    const chevron = el("span", "chevron", collapsed ? "▸" : "▾");
+    header.appendChild(chevron);
+    header.addEventListener("click", () => {
+      this.workSurfaceCollapsed = !this.workSurfaceCollapsed;
+      writeBool("workSurfaceCollapsed", this.workSurfaceCollapsed);
+      this.render();
+    });
+    card.appendChild(header);
+
+    if (collapsed) return card;
+
     const margins = this.computeMargins(proj, ws);
     const pending = this.state.pendingMargins ?? {
       left: String(margins.left),
@@ -648,64 +696,162 @@ class ControlApp {
     const card = el("div", "card");
     card.appendChild(el("h2", "", "Camera"));
 
-    const row = el("div", "row");
-    if (this.state.cameraOpen && this.state.cameraIndex !== null) {
-      row.appendChild(el("span", "pill ok", "Live"));
+    const showPicker = !this.state.cameraOpen || this.state.switchingCamera;
+
+    if (this.state.cameraOpen && this.state.cameraIndex !== null && !this.state.switchingCamera) {
+      // Live: preview is the prominent thing, plus a thin status row + actions.
+      card.appendChild(this.renderCameraPreview(this.state.mode === "calibrate"));
+
+      const status = el("div", "row");
+      status.appendChild(el("span", "pill ok", "Live"));
       const current = this.state.cameras.find((c) => c.index === this.state.cameraIndex);
       const label = current ? `${current.name} (index ${current.index})` : `Camera ${this.state.cameraIndex}`;
-      row.appendChild(el("div", "v", label));
-    } else if (this.state.switchingCamera) {
-      row.appendChild(el("span", "pill warn", "Opening…"));
-    } else {
-      row.appendChild(el("span", "pill muted", "Closed"));
-      row.appendChild(el("div", "v", "no camera selected"));
+      status.appendChild(el("div", "v", label));
+      card.appendChild(status);
+
+      const actions = el("div", "row");
+      const switchBtn = el("button", "", "Switch camera");
+      switchBtn.addEventListener("click", () => {
+        this.state.switchingCamera = true;
+        void this.fetchCameras();
+      });
+      actions.appendChild(switchBtn);
+
+      const rotateBtn = el(
+        "button",
+        "",
+        this.previewRotation === 180 ? "Rotate preview (180°)" : "Rotate preview",
+      );
+      rotateBtn.title = "Cycle preview rotation. Cosmetic only — does not affect calibration.";
+      rotateBtn.addEventListener("click", () => {
+        this.previewRotation = this.previewRotation === 0 ? 180 : 0;
+        writeNumber("previewRotation", this.previewRotation);
+        this.render();
+      });
+      actions.appendChild(rotateBtn);
+
+      const closeBtn = el("button", "", "Close camera");
+      closeBtn.addEventListener("click", () => this.switchCamera(null));
+      actions.appendChild(closeBtn);
+      card.appendChild(actions);
     }
-    card.appendChild(row);
 
     if (this.state.cameraError) {
       card.appendChild(el("div", "help warn-text", `Error: ${this.state.cameraError}`));
     }
 
-    if (this.state.cameraOpen) {
-      const preview = el("div", "camera-preview");
-      const img = el("img");
-      img.src = `${SERVER_HTTP}/camera/preview.mjpg?t=${Date.now()}`;
-      img.alt = "Camera preview";
-      preview.appendChild(img);
-      card.appendChild(preview);
-    }
+    if (showPicker) {
+      const status = el("div", "row");
+      if (this.state.switchingCamera) {
+        status.appendChild(el("span", "pill warn", "Opening…"));
+      } else {
+        status.appendChild(el("span", "pill muted", "Closed"));
+        status.appendChild(el("div", "v", "no camera selected"));
+      }
+      card.appendChild(status);
 
-    if (this.state.cameras.length === 0) {
       card.appendChild(
         el(
           "div",
           "help",
-          this.state.cameraError
-            ? "Could not list cameras."
-            : "No cameras detected. Plug in a camera and click Refresh.",
+          this.state.cameraOpen
+            ? "Pick a different camera. The current one will be closed automatically."
+            : "Pick which camera looks at the mat. macOS may prompt for camera permission the first time.",
         ),
       );
-    } else {
-      const list = el("div", "displays");
-      for (const c of this.state.cameras) {
-        list.appendChild(this.renderCameraRow(c));
+
+      if (this.state.cameras.length === 0) {
+        card.appendChild(
+          el(
+            "div",
+            "help",
+            this.state.cameraError
+              ? "Could not list cameras."
+              : "No cameras detected. Plug in a camera and click Refresh.",
+          ),
+        );
+      } else {
+        const list = el("div", "displays");
+        for (const c of this.state.cameras) {
+          list.appendChild(this.renderCameraRow(c));
+        }
+        card.appendChild(list);
       }
-      card.appendChild(list);
-    }
 
-    const actions = el("div", "row");
-    const refresh = el("button", "", "Refresh list");
-    refresh.addEventListener("click", () => void this.fetchCameras());
-    actions.appendChild(refresh);
+      const actions = el("div", "row");
+      const refresh = el("button", "", "Refresh list");
+      refresh.addEventListener("click", () => void this.fetchCameras());
+      actions.appendChild(refresh);
 
-    if (this.state.cameraOpen) {
-      const closeBtn = el("button", "", "Close camera");
-      closeBtn.addEventListener("click", () => this.switchCamera(null));
-      actions.appendChild(closeBtn);
+      if (this.state.cameraOpen && this.state.switchingCamera) {
+        const cancel = el("button", "", "Cancel");
+        cancel.addEventListener("click", () => {
+          this.state.switchingCamera = false;
+          this.render();
+        });
+        actions.appendChild(cancel);
+      }
+      card.appendChild(actions);
     }
-    card.appendChild(actions);
 
     return card;
+  }
+
+  private renderCameraPreview(showMarkerOverlay: boolean): HTMLElement {
+    const wrap = el("div", "calib-preview");
+    if (this.previewRotation === 180) wrap.classList.add("rot-180");
+
+    if (!this.cameraPreviewImg) {
+      this.cameraPreviewImg = document.createElement("img");
+      this.cameraPreviewImg.src = `${SERVER_HTTP}/camera/preview.mjpg`;
+      this.cameraPreviewImg.alt = "Camera preview";
+    }
+    // Re-using the same element across renders keeps the MJPEG stream alive even
+    // though render() blows away the rest of the DOM via innerHTML = "".
+    wrap.appendChild(this.cameraPreviewImg);
+
+    if (showMarkerOverlay) {
+      const diag = this.state.calibDiag;
+      if (diag && diag.frameWidth > 0 && diag.frameHeight > 0) {
+        wrap.appendChild(this.buildMarkerOverlay(diag));
+      }
+    }
+    return wrap;
+  }
+
+  private buildMarkerOverlay(diag: CalibrationDiagnostic): SVGSVGElement {
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("class", "calib-overlay");
+    svg.setAttribute("viewBox", `0 0 ${diag.frameWidth} ${diag.frameHeight}`);
+    svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
+    diag.detectedIds.forEach((id, i) => {
+      const corners = diag.detectedCorners[i];
+      if (!corners || corners.length !== 4) return;
+      const polygon = document.createElementNS(SVG_NS, "polygon");
+      polygon.setAttribute("points", corners.map((c) => `${c[0]},${c[1]}`).join(" "));
+      polygon.setAttribute("fill", "rgba(74,222,128,0.15)");
+      polygon.setAttribute("stroke", "#4ade80");
+      polygon.setAttribute("stroke-width", "4");
+      svg.appendChild(polygon);
+
+      const cx = corners.reduce((s, c) => s + c[0], 0) / 4;
+      const cy = corners.reduce((s, c) => s + c[1], 0) / 4;
+      const label = document.createElementNS(SVG_NS, "text");
+      label.setAttribute("x", String(cx));
+      label.setAttribute("y", String(cy));
+      label.setAttribute("text-anchor", "middle");
+      label.setAttribute("dominant-baseline", "middle");
+      label.setAttribute("fill", "#0a0c10");
+      label.setAttribute("stroke", "#4ade80");
+      label.setAttribute("stroke-width", "1");
+      label.setAttribute("font-size", "48");
+      label.setAttribute("font-weight", "bold");
+      label.setAttribute("font-family", "ui-monospace, monospace");
+      label.textContent = String(id);
+      svg.appendChild(label);
+    });
+    return svg;
   }
 
   private renderCameraRow(c: CameraInfo): HTMLElement {
@@ -756,21 +902,66 @@ class ControlApp {
     const card = el("div", "card");
     card.appendChild(el("h2", "", "Calibration"));
 
+    if (!this.state.cameraOpen) {
+      card.appendChild(
+        el(
+          "div",
+          "help warn-text",
+          "No camera open. Pick one in the Camera card above so the system can see the projected markers.",
+        ),
+      );
+      return card;
+    }
+
+    if (!this.state.projector) {
+      card.appendChild(
+        el(
+          "div",
+          "help warn-text",
+          "Projector window is not open. Launch it from the Projector display card above so the markers can be projected.",
+        ),
+      );
+      return card;
+    }
+
+    // Status pill
     const status = el("div", "row");
     if (this.state.capturedMarkers === 4) {
       status.appendChild(el("span", "pill ok", "All 4 markers detected"));
+    } else if (this.state.capturedMarkers > 0) {
+      status.appendChild(el("span", "pill warn", `${this.state.capturedMarkers}/4 markers detected`));
     } else {
-      status.appendChild(el("span", "pill warn", `Detecting markers… (${this.state.capturedMarkers}/4)`));
+      status.appendChild(el("span", "pill error", "0/4 markers — camera can't see the projection"));
     }
     card.appendChild(status);
 
     card.appendChild(
-      el(
-        "div",
-        "help",
-        "On the mat, measure the distance between the centers of the top-left and top-right projected markers. Type the value in millimeters and click Save.",
-      ),
+      el("div", "help", "Watch the live preview in the Camera card above — green outlines mark each detected marker."),
     );
+
+    // What the projector is actually drawing (so user can confirm markers ARE projected)
+    const ids = this.state.calibDiag?.detectedIds ?? [];
+    const expected = [10, 11, 12, 13];
+    const missing = expected.filter((id) => !ids.includes(id));
+    if (missing.length > 0) {
+      card.appendChild(
+        el(
+          "div",
+          "help",
+          `Expected marker IDs 10–13. Currently missing: ${missing.join(", ")}. ` +
+            "If the camera doesn't see them, check that the projector is showing 4 black-and-white squares, the camera is pointed at the mat, " +
+            "and the work-surface outline matches the mat edges.",
+        ),
+      );
+    } else {
+      card.appendChild(
+        el(
+          "div",
+          "help",
+          "All 4 markers visible. Measure the on-mat distance between the centers of the top-left (id 10) and top-right (id 11) markers, type it in millimeters, and click Save.",
+        ),
+      );
+    }
 
     const inputRow = el("div", "row");
     const input = el("input") as HTMLInputElement;
@@ -797,6 +988,7 @@ class ControlApp {
 
     return card;
   }
+
 
   private renderTrackCard(): HTMLElement {
     const card = el("div", "card");
@@ -856,6 +1048,43 @@ function parsePending(p: PendingMargins): { left: number; top: number; right: nu
 
 function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
+}
+
+function readBool(key: string, fallback: boolean): boolean {
+  try {
+    const v = localStorage.getItem("projectoros." + key);
+    if (v === null) return fallback;
+    return v === "1";
+  } catch {
+    return fallback;
+  }
+}
+
+function writeBool(key: string, v: boolean): void {
+  try {
+    localStorage.setItem("projectoros." + key, v ? "1" : "0");
+  } catch {
+    /* ignore */
+  }
+}
+
+function readNumber(key: string, fallback: number): number {
+  try {
+    const v = localStorage.getItem("projectoros." + key);
+    if (v === null) return fallback;
+    const n = parseFloat(v);
+    return Number.isFinite(n) ? n : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeNumber(key: string, v: number): void {
+  try {
+    localStorage.setItem("projectoros." + key, String(v));
+  } catch {
+    /* ignore */
+  }
 }
 
 function formatRelativeTime(ts: number): string {

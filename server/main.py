@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from server import preferences as prefs_persist
 from server import work_surface as ws_persist
 from server.bus import Bus
 from server.calibration import (
@@ -50,6 +51,7 @@ log = logging.getLogger("server.main")
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 CALIBRATION_PATH = DATA_DIR / "calibration.json"
 WORK_SURFACE_PATH = DATA_DIR / "work_surface.json"
+PREFERENCES_PATH = DATA_DIR / "preferences.json"
 DETECTION_BROADCAST_HZ = 20.0
 
 
@@ -62,9 +64,10 @@ class AppState:
         self.mode: Mode = "idle"
         self.projector_dims: tuple[int, int] | None = None
         self.work_surface: WorkSurface | None = ws_persist.load(WORK_SURFACE_PATH)
-        self.show_work_surface_outline: bool = True
         self.camera_index: int | None = None
         self.launcher = ProjectorLauncher()
+        self.preferences = prefs_persist.load(PREFERENCES_PATH)
+        self.show_work_surface_outline: bool = self.preferences.show_work_surface_outline
         self._calibration_layout: list = []
         self._calibration_proj_w: int = 0
         self._calibration_proj_h: int = 0
@@ -72,6 +75,7 @@ class AppState:
         self._loop_task: asyncio.Task | None = None
 
     async def start(self) -> None:
+        # Camera: env var wins for one-off overrides; otherwise restore the saved index.
         cam_env = os.environ.get("CAMERA_INDEX")
         if cam_env is not None:
             try:
@@ -79,7 +83,36 @@ class AppState:
             except ValueError:
                 idx = 0
             await self._open_camera(idx)
+        elif self.preferences.camera_index is not None:
+            log.info("restoring saved camera index %d", self.preferences.camera_index)
+            await self._open_camera(self.preferences.camera_index)
+
         self._loop_task = asyncio.create_task(self._run_loop(), name="frame-loop")
+
+        # Projector: re-launch the kiosk on the previously chosen display, after a short
+        # delay so the Vite dev server is reachable.
+        if self.preferences.projector_display is not None:
+            asyncio.create_task(self._auto_launch_projector(), name="auto-launch-projector")
+
+    async def _auto_launch_projector(self) -> None:
+        await asyncio.sleep(2.0)
+        d = self.preferences.projector_display
+        if d is None or self.launcher.is_running():
+            return
+        log.info("restoring projector kiosk on saved display (%d, %d) %dx%d", d.x, d.y, d.width, d.height)
+        try:
+            self.launch_projector(d.x, d.y, d.width, d.height)
+        except RuntimeError as e:
+            log.warning("auto-launch failed: %s", e)
+
+    def launch_projector(self, x: int, y: int, width: int, height: int) -> None:
+        ui_port = int(os.environ.get("UI_PORT", "5173"))
+        ui_url = f"http://localhost:{ui_port}/"
+        self.launcher.launch(x, y, width, height, ui_url)
+        self.preferences.projector_display = prefs_persist.ProjectorDisplay(
+            x=x, y=y, width=width, height=height
+        )
+        prefs_persist.save(self.preferences, PREFERENCES_PATH)
 
     async def _open_camera(self, index: int) -> str | None:
         """Open the given camera index, replacing any existing one. Returns error string or None."""
@@ -103,9 +136,14 @@ class AppState:
                 self.camera.close()
             self.camera = None
             self.camera_index = None
+            self.preferences.camera_index = None
+            prefs_persist.save(self.preferences, PREFERENCES_PATH)
             await self.bus.broadcast(CameraChangedEvent(camera_index=None, camera_open=False))
             return
         err = await self._open_camera(index)
+        # Save whatever the user chose, even if it failed to open — they can retry next time.
+        self.preferences.camera_index = index
+        prefs_persist.save(self.preferences, PREFERENCES_PATH)
         await self.bus.broadcast(
             CameraChangedEvent(
                 camera_index=self.camera_index,
@@ -150,9 +188,11 @@ class AppState:
         ws = WorkSurface(x=x, y=y, width=w, height=h, updated_at=time.time())
         ws = ws_persist.clamp(ws, proj_w, proj_h)
         self.work_surface = ws
-        if show_outline is not None:
-            self.show_work_surface_outline = show_outline
         ws_persist.save(ws, WORK_SURFACE_PATH)
+        if show_outline is not None and show_outline != self.show_work_surface_outline:
+            self.show_work_surface_outline = show_outline
+            self.preferences.show_work_surface_outline = show_outline
+            prefs_persist.save(self.preferences, PREFERENCES_PATH)
         await self._broadcast_work_surface()
 
     async def _broadcast_work_surface(self) -> None:
@@ -197,8 +237,10 @@ class AppState:
         await self.set_mode("track")
 
     async def _run_loop(self) -> None:
-        last_broadcast = 0.0
-        broadcast_interval = 1.0 / DETECTION_BROADCAST_HZ
+        last_track_broadcast = 0.0
+        track_interval = 1.0 / DETECTION_BROADCAST_HZ
+        last_calib_broadcast = 0.0
+        calib_interval = 1.0 / 6.0
         try:
             while True:
                 await asyncio.sleep(0.005)
@@ -214,19 +256,27 @@ class AppState:
                     capture = detect_projected_markers(frame)
                     if len(capture.cam_corners_by_id) == 4:
                         self._calibration_captures.append(capture)
-                        # Keep last 10 captures for averaging
                         if len(self._calibration_captures) > 10:
                             self._calibration_captures.pop(0)
-                        if len(self._calibration_captures) % 5 == 0:
-                            await self.bus.broadcast(
-                                CalibrationCapturedEvent(detected_marker_ids=sorted(capture.cam_corners_by_id.keys()))
+                    if ts - last_calib_broadcast >= calib_interval:
+                        h, w = frame.shape[:2]
+                        ids = sorted(capture.cam_corners_by_id.keys())
+                        corners = [capture.cam_corners_by_id[mid].tolist() for mid in ids]
+                        await self.bus.broadcast(
+                            CalibrationCapturedEvent(
+                                detected_marker_ids=ids,
+                                detected_corners_cam=corners,
+                                frame_width=w,
+                                frame_height=h,
                             )
+                        )
+                        last_calib_broadcast = ts
                 elif self.mode == "track" and self.calibration is not None:
-                    if ts - last_broadcast < broadcast_interval:
+                    if ts - last_track_broadcast < track_interval:
                         continue
                     objects = self.detector.detect(frame, self.calibration)
                     await self.bus.broadcast(DetectionsEvent(objects=objects, ts=now_ts()))
-                    last_broadcast = ts
+                    last_track_broadcast = ts
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -272,10 +322,8 @@ async def get_displays():
 
 @app.post("/launch_projector")
 async def launch_projector(req: LaunchProjectorRequest):
-    ui_port = int(os.environ.get("UI_PORT", "5173"))
-    ui_url = f"http://localhost:{ui_port}/"
     try:
-        state.launcher.launch(req.x, req.y, req.width, req.height, ui_url)
+        state.launch_projector(req.x, req.y, req.width, req.height)
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
     return {"ok": True}
@@ -284,6 +332,8 @@ async def launch_projector(req: LaunchProjectorRequest):
 @app.post("/close_projector")
 async def close_projector():
     state.launcher.close()
+    state.preferences.projector_display = None
+    prefs_persist.save(state.preferences, PREFERENCES_PATH)
     return {"ok": True}
 
 

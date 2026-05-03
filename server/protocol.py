@@ -80,10 +80,18 @@ class CalibrationPromptEvent(BaseModel):
 
 
 class CalibrationCapturedEvent(BaseModel):
-    """Sent after the camera has detected the projected markers; UI shows status to user."""
+    """Diagnostic broadcast at ~6 Hz while in calibrate mode.
+
+    Always sent regardless of how many markers are detected, so the UI can show progress
+    (1/4, 2/4 …) and overlay detected corners on the camera preview. Even with 0 markers
+    we send the frame size so the UI knows the preview is alive.
+    """
 
     type: Literal["calibration_captured"] = "calibration_captured"
     detected_marker_ids: list[int]
+    detected_corners_cam: list[list[list[float]]] = []
+    frame_width: int = 0
+    frame_height: int = 0
 
 
 class ProjectorRegisteredEvent(BaseModel):
