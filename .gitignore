@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.python-version
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# Project
+data/calibration.json
+data/*.png
+data/*.jpg
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/

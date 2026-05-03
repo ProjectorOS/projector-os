@@ -1,0 +1,871 @@
+// Control entry: regular web UI for driving the system from the laptop browser.
+// Connects to the same WebSocket as the projector view; either client can issue
+// commands and both stay in sync via server broadcasts.
+
+import type { Calibration, DetectedObject, Mode, ServerEvent, WorkSurface } from "./types";
+import { defaultServerHttpUrl, defaultServerWsUrl, WsClient } from "./ws-client";
+
+interface Display {
+  index: number;
+  name: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  is_main: boolean;
+}
+
+interface DisplaysResponse {
+  displays: Display[];
+  projector_running: boolean;
+}
+
+interface CameraInfo {
+  index: number;
+  name: string;
+  unique_id: string;
+}
+
+interface CamerasResponse {
+  cameras: CameraInfo[];
+  current_index: number | null;
+  camera_open: boolean;
+}
+
+interface PendingMargins {
+  left: string;
+  top: string;
+  right: string;
+  bottom: string;
+}
+
+interface ViewState {
+  mode: Mode;
+  connection: "connecting" | "open" | "closed";
+  calibration: Calibration | null;
+  projector: [number, number] | null;
+  capturedMarkers: number;
+  detections: DetectedObject[];
+  lastDetectionTs: number | null;
+  displays: Display[];
+  projectorRunning: boolean;
+  displaysError: string | null;
+  switchingDisplay: boolean;
+  workSurface: WorkSurface | null;
+  showWorkSurfaceOutline: boolean;
+  pendingMargins: PendingMargins | null;
+  cameras: CameraInfo[];
+  cameraIndex: number | null;
+  cameraOpen: boolean;
+  cameraError: string | null;
+  switchingCamera: boolean;
+}
+
+const SERVER_HTTP = defaultServerHttpUrl();
+
+class ControlApp {
+  private state: ViewState = {
+    mode: "idle",
+    connection: "connecting",
+    calibration: null,
+    projector: null,
+    capturedMarkers: 0,
+    detections: [],
+    lastDetectionTs: null,
+    displays: [],
+    projectorRunning: false,
+    displaysError: null,
+    switchingDisplay: false,
+    workSurface: null,
+    showWorkSurfaceOutline: true,
+    pendingMargins: null,
+    cameras: [],
+    cameraIndex: null,
+    cameraOpen: false,
+    cameraError: null,
+    switchingCamera: false,
+  };
+  private readonly ws: WsClient;
+  private pendingMm = "";
+  // While the user is dragging a work-surface edge, suppress full re-renders so the
+  // SVG handles and pointer state stay alive. Updates apply directly via DOM refs.
+  private draggingEdge: "top" | "bottom" | "left" | "right" | null = null;
+
+  constructor(private readonly root: HTMLElement) {
+    this.ws = new WsClient({
+      url: defaultServerWsUrl(),
+      onEvent: (e) => this.onEvent(e),
+      onState: (s) => {
+        this.state.connection = s;
+        if (s === "open") {
+          void this.fetchDisplays();
+          void this.fetchCameras();
+        }
+        this.render();
+      },
+    });
+  }
+
+  start(): void {
+    this.render();
+    this.ws.connect();
+    void this.fetchDisplays();
+    void this.fetchCameras();
+  }
+
+  private onEvent(ev: ServerEvent): void {
+    switch (ev.type) {
+      case "hello":
+        this.state.mode = ev.mode;
+        this.state.calibration = ev.calibration;
+        this.state.projector = ev.projector;
+        this.state.workSurface = ev.work_surface;
+        this.state.showWorkSurfaceOutline = ev.show_work_surface_outline;
+        this.state.cameraIndex = ev.camera_index;
+        this.state.cameraOpen = ev.camera_open;
+        break;
+      case "mode_changed":
+        this.state.mode = ev.mode;
+        if (ev.mode !== "calibrate") this.state.capturedMarkers = 0;
+        break;
+      case "calibration_updated":
+        this.state.calibration = ev.calibration;
+        break;
+      case "calibration_prompt":
+        this.state.capturedMarkers = 0;
+        break;
+      case "calibration_captured":
+        this.state.capturedMarkers = ev.detected_marker_ids.length;
+        break;
+      case "projector_registered":
+        this.state.projector = [ev.proj_width, ev.proj_height];
+        this.state.switchingDisplay = false;
+        void this.fetchDisplays();
+        break;
+      case "work_surface_updated":
+        this.state.workSurface = ev.work_surface;
+        this.state.showWorkSurfaceOutline = ev.show_outline;
+        // Drop any pending edits — they're now stale.
+        this.state.pendingMargins = null;
+        break;
+      case "camera_changed":
+        this.state.cameraIndex = ev.camera_index;
+        this.state.cameraOpen = ev.camera_open;
+        this.state.cameraError = ev.error;
+        this.state.switchingCamera = false;
+        break;
+      case "detections":
+        this.state.detections = ev.objects;
+        this.state.lastDetectionTs = ev.ts;
+        break;
+    }
+    this.render();
+  }
+
+  private async fetchDisplays(): Promise<void> {
+    try {
+      const res = await fetch(`${SERVER_HTTP}/displays`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = (await res.json()) as DisplaysResponse;
+      this.state.displays = data.displays;
+      this.state.projectorRunning = data.projector_running;
+      this.state.displaysError = null;
+    } catch (e) {
+      this.state.displaysError = e instanceof Error ? e.message : String(e);
+    }
+    this.render();
+  }
+
+  private async fetchCameras(): Promise<void> {
+    try {
+      const res = await fetch(`${SERVER_HTTP}/cameras`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = (await res.json()) as CamerasResponse;
+      this.state.cameras = data.cameras;
+      this.state.cameraIndex = data.current_index;
+      this.state.cameraOpen = data.camera_open;
+    } catch (e) {
+      this.state.cameraError = e instanceof Error ? e.message : String(e);
+    }
+    this.render();
+  }
+
+  private switchCamera(index: number | null): void {
+    this.state.switchingCamera = true;
+    this.state.cameraError = null;
+    this.ws.send({ type: "set_camera", index });
+    this.render();
+  }
+
+  private async launchProjector(d: Display): Promise<void> {
+    try {
+      const res = await fetch(`${SERVER_HTTP}/launch_projector`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ x: d.x, y: d.y, width: d.width, height: d.height }),
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
+        throw new Error(detail.detail ?? `HTTP ${res.status}`);
+      }
+      this.state.switchingDisplay = false;
+      await this.fetchDisplays();
+    } catch (e) {
+      this.state.displaysError = e instanceof Error ? e.message : String(e);
+      this.render();
+    }
+  }
+
+  private async closeProjector(): Promise<void> {
+    try {
+      await fetch(`${SERVER_HTTP}/close_projector`, { method: "POST" });
+      this.state.projector = null;
+      this.state.switchingDisplay = false;
+      await this.fetchDisplays();
+    } catch {
+      // Non-fatal; control panel still works.
+    }
+  }
+
+  private render(): void {
+    if (this.draggingEdge) return;
+    this.root.innerHTML = "";
+    this.root.appendChild(this.renderStatusCard());
+    this.root.appendChild(this.renderDisplayCard());
+    if (this.state.projector) {
+      this.root.appendChild(this.renderWorkSurfaceCard());
+    }
+    this.root.appendChild(this.renderCameraCard());
+    this.root.appendChild(this.renderModeCard());
+    if (this.state.mode === "calibrate") {
+      this.root.appendChild(this.renderCalibrationCard());
+    }
+    if (this.state.mode === "track") {
+      this.root.appendChild(this.renderTrackCard());
+    }
+  }
+
+  private renderStatusCard(): HTMLElement {
+    const card = el("div", "card");
+    card.appendChild(el("h2", "", "Status"));
+
+    const kv = el("div", "kv");
+    kv.appendChild(el("div", "k", "Connection"));
+    kv.appendChild(this.connectionPill());
+    kv.appendChild(el("div", "k", "Mode"));
+    kv.appendChild(this.modePill());
+    kv.appendChild(el("div", "k", "Calibration"));
+    kv.appendChild(
+      el(
+        "div",
+        "v",
+        this.state.calibration
+          ? `${this.state.calibration.mat_width_mm.toFixed(1)} × ${this.state.calibration.mat_height_mm.toFixed(1)} mm — ${formatRelativeTime(this.state.calibration.created_at)}`
+          : "not calibrated",
+      ),
+    );
+    card.appendChild(kv);
+    return card;
+  }
+
+  private renderDisplayCard(): HTMLElement {
+    const card = el("div", "card");
+    card.appendChild(el("h2", "", "Projector display"));
+
+    const projectorOpen = this.state.projector !== null;
+    const showPicker = !projectorOpen || this.state.switchingDisplay;
+
+    if (projectorOpen && !this.state.switchingDisplay) {
+      const [w, h] = this.state.projector!;
+      const matched = this.state.displays.find((d) => d.width === w && d.height === h);
+      const label = matched
+        ? `${matched.name} — ${w} × ${h} px`
+        : `connected — ${w} × ${h} px`;
+      const row = el("div", "row");
+      row.appendChild(el("span", "pill ok", "Open"));
+      row.appendChild(el("div", "v", label));
+      card.appendChild(row);
+
+      const actions = el("div", "row");
+      const switchBtn = el("button", "", "Switch display");
+      switchBtn.addEventListener("click", () => {
+        this.state.switchingDisplay = true;
+        void this.fetchDisplays();
+      });
+      actions.appendChild(switchBtn);
+
+      const closeBtn = el("button", "", "Close projector window");
+      closeBtn.addEventListener("click", () => void this.closeProjector());
+      actions.appendChild(closeBtn);
+      card.appendChild(actions);
+    }
+
+    if (showPicker) {
+      const help = el(
+        "div",
+        "help",
+        projectorOpen
+          ? "Pick a different display. The current projector window will be closed automatically."
+          : "Pick which connected display the projector is pointing at. The kiosk window will open there in fullscreen.",
+      );
+      card.appendChild(help);
+
+      if (this.state.displays.length === 0) {
+        card.appendChild(
+          el(
+            "div",
+            "help",
+            this.state.displaysError
+              ? `Could not list displays: ${this.state.displaysError}`
+              : "No displays found.",
+          ),
+        );
+      } else {
+        const list = el("div", "displays");
+        for (const d of this.state.displays) {
+          list.appendChild(this.renderDisplayRow(d));
+        }
+        card.appendChild(list);
+      }
+
+      const actions = el("div", "row");
+      const refresh = el("button", "", "Refresh list");
+      refresh.addEventListener("click", () => void this.fetchDisplays());
+      actions.appendChild(refresh);
+
+      if (projectorOpen && this.state.switchingDisplay) {
+        const cancel = el("button", "", "Cancel");
+        cancel.addEventListener("click", () => {
+          this.state.switchingDisplay = false;
+          this.render();
+        });
+        actions.appendChild(cancel);
+      }
+      card.appendChild(actions);
+    }
+
+    return card;
+  }
+
+  private renderDisplayRow(d: Display): HTMLElement {
+    const row = el("div", "display-row");
+    const info = el("div", "display-info");
+    info.appendChild(el("div", "display-name", d.name + (d.is_main ? "  (main)" : "")));
+    info.appendChild(
+      el(
+        "div",
+        "display-meta",
+        `${d.width} × ${d.height} px @ (${d.x}, ${d.y})`,
+      ),
+    );
+    row.appendChild(info);
+
+    const launchBtn = el("button", "primary", d.is_main ? "Launch on this display" : "Launch");
+    launchBtn.addEventListener("click", () => void this.launchProjector(d));
+    row.appendChild(launchBtn);
+    return row;
+  }
+
+  private renderWorkSurfaceCard(): HTMLElement {
+    const card = el("div", "card");
+    card.appendChild(el("h2", "", "Work surface"));
+
+    const proj = this.state.projector!;
+    const ws = this.state.workSurface;
+    const margins = this.computeMargins(proj, ws);
+    const pending = this.state.pendingMargins ?? {
+      left: String(margins.left),
+      top: String(margins.top),
+      right: String(margins.right),
+      bottom: String(margins.bottom),
+    };
+    this.state.pendingMargins = pending;
+
+    const info = el("div", "kv");
+    info.appendChild(el("div", "k", "Projector"));
+    info.appendChild(el("div", "v", `${proj[0]} × ${proj[1]} px`));
+    info.appendChild(el("div", "k", "Work surface"));
+    const wsInfo = el("div", "v");
+    wsInfo.dataset.role = "ws-info";
+    wsInfo.textContent = ws ? `${ws.width} × ${ws.height} px @ (${ws.x}, ${ws.y})` : "not set";
+    info.appendChild(wsInfo);
+    card.appendChild(info);
+
+    card.appendChild(
+      el(
+        "div",
+        "help",
+        "Drag the dashed edges in the preview, or type margin values directly. Changes apply when you release the edge or click Apply.",
+      ),
+    );
+
+    const grid = el("div", "margin-grid");
+    grid.appendChild(this.marginField("Top", "top", pending.top));
+    grid.appendChild(this.marginField("Bottom", "bottom", pending.bottom));
+    grid.appendChild(this.marginField("Left", "left", pending.left));
+    grid.appendChild(this.marginField("Right", "right", pending.right));
+    card.appendChild(grid);
+
+    card.appendChild(this.buildWorkSurfacePreview(proj, pending));
+
+    const toggleRow = el("label", "toggle-row");
+    const toggle = el("input") as HTMLInputElement;
+    toggle.type = "checkbox";
+    toggle.checked = this.state.showWorkSurfaceOutline;
+    toggle.addEventListener("change", () => {
+      this.applyMargins(this.state.pendingMargins!, toggle.checked);
+    });
+    toggleRow.appendChild(toggle);
+    toggleRow.appendChild(el("span", "", "Show outline on projector"));
+    card.appendChild(toggleRow);
+
+    const actions = el("div", "row");
+    const apply = el("button", "primary", "Apply");
+    apply.addEventListener("click", () =>
+      this.applyMargins(this.state.pendingMargins!, this.state.showWorkSurfaceOutline),
+    );
+    actions.appendChild(apply);
+
+    const reset = el("button", "", "Reset to full projection");
+    reset.addEventListener("click", () => {
+      this.state.pendingMargins = null;
+      this.applyMargins(
+        { left: "0", top: "0", right: "0", bottom: "0" },
+        this.state.showWorkSurfaceOutline,
+      );
+    });
+    actions.appendChild(reset);
+    card.appendChild(actions);
+
+    return card;
+  }
+
+  private marginField(label: string, name: "top" | "bottom" | "left" | "right", value: string): HTMLElement {
+    const wrapper = el("label", "margin-field");
+    wrapper.appendChild(el("span", "k", label));
+    const input = el("input") as HTMLInputElement;
+    input.type = "number";
+    input.min = "0";
+    input.step = "1";
+    input.placeholder = "0";
+    input.value = value;
+    input.dataset.field = name;
+    input.addEventListener("input", () => {
+      const pending = { ...this.state.pendingMargins!, [name]: input.value };
+      this.state.pendingMargins = pending;
+      this.updatePreviewSvg(pending);
+    });
+    wrapper.appendChild(input);
+    return wrapper;
+  }
+
+  private buildWorkSurfacePreview(proj: [number, number], pending: PendingMargins): SVGSVGElement {
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    const previewW = 320;
+    const scale = previewW / proj[0];
+    const previewH = Math.round(proj[1] * scale);
+
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("class", "ws-preview");
+    svg.setAttribute("width", String(previewW));
+    svg.setAttribute("height", String(previewH));
+    svg.setAttribute("viewBox", `0 0 ${previewW} ${previewH}`);
+    svg.dataset.scale = String(scale);
+
+    const outer = document.createElementNS(SVG_NS, "rect");
+    outer.setAttribute("x", "0");
+    outer.setAttribute("y", "0");
+    outer.setAttribute("width", String(previewW));
+    outer.setAttribute("height", String(previewH));
+    outer.setAttribute("fill", "#0a0c10");
+    outer.setAttribute("stroke", "#475569");
+    outer.setAttribute("stroke-width", "1");
+    svg.appendChild(outer);
+
+    const innerRect = document.createElementNS(SVG_NS, "rect");
+    innerRect.dataset.role = "inner-rect";
+    innerRect.setAttribute("fill", "rgba(74,222,128,0.08)");
+    innerRect.setAttribute("stroke", "#4ade80");
+    innerRect.setAttribute("stroke-width", "1.5");
+    innerRect.setAttribute("stroke-dasharray", "4 3");
+    svg.appendChild(innerRect);
+
+    // Edge handles. Each has a small hit area; pointer-events catch the drag.
+    const edges: ("top" | "bottom" | "left" | "right")[] = ["top", "bottom", "left", "right"];
+    for (const edge of edges) {
+      const handle = document.createElementNS(SVG_NS, "rect");
+      handle.dataset.edge = edge;
+      handle.setAttribute("fill", "transparent");
+      handle.style.cursor = edge === "top" || edge === "bottom" ? "ns-resize" : "ew-resize";
+      handle.addEventListener("pointerdown", (e: PointerEvent) =>
+        this.startEdgeDrag(edge, e, svg, innerRect, scale, proj),
+      );
+      svg.appendChild(handle);
+    }
+
+    this.applyPreviewLayout(svg, proj, pending);
+    return svg;
+  }
+
+  private updatePreviewSvg(pending: PendingMargins): void {
+    const svg = this.root.querySelector(".ws-preview") as SVGSVGElement | null;
+    const proj = this.state.projector;
+    if (!svg || !proj) return;
+    this.applyPreviewLayout(svg, proj, pending);
+  }
+
+  private applyPreviewLayout(svg: SVGSVGElement, proj: [number, number], pending: PendingMargins): void {
+    const scale = parseFloat(svg.dataset.scale ?? "1");
+    const m = parsePending(pending);
+    const innerX = m.left * scale;
+    const innerY = m.top * scale;
+    const innerW = Math.max(0, (proj[0] - m.left - m.right) * scale);
+    const innerH = Math.max(0, (proj[1] - m.top - m.bottom) * scale);
+
+    const innerRect = svg.querySelector('rect[data-role="inner-rect"]') as SVGRectElement | null;
+    if (innerRect) {
+      innerRect.setAttribute("x", String(innerX));
+      innerRect.setAttribute("y", String(innerY));
+      innerRect.setAttribute("width", String(innerW));
+      innerRect.setAttribute("height", String(innerH));
+    }
+
+    const T = 10; // handle thickness
+    const layouts: Record<"top" | "bottom" | "left" | "right", { x: number; y: number; w: number; h: number }> = {
+      top: { x: innerX, y: innerY - T / 2, w: innerW, h: T },
+      bottom: { x: innerX, y: innerY + innerH - T / 2, w: innerW, h: T },
+      left: { x: innerX - T / 2, y: innerY, w: T, h: innerH },
+      right: { x: innerX + innerW - T / 2, y: innerY, w: T, h: innerH },
+    };
+    for (const edge of Object.keys(layouts) as Array<keyof typeof layouts>) {
+      const handle = svg.querySelector(`rect[data-edge="${edge}"]`) as SVGRectElement | null;
+      if (!handle) continue;
+      const { x, y, w, h } = layouts[edge];
+      handle.setAttribute("x", String(x));
+      handle.setAttribute("y", String(y));
+      handle.setAttribute("width", String(Math.max(0, w)));
+      handle.setAttribute("height", String(Math.max(0, h)));
+    }
+  }
+
+  private startEdgeDrag(
+    edge: "top" | "bottom" | "left" | "right",
+    e: PointerEvent,
+    svg: SVGSVGElement,
+    _innerRect: SVGRectElement,
+    scale: number,
+    proj: [number, number],
+  ): void {
+    e.preventDefault();
+    const startMargins = parsePending(this.state.pendingMargins!);
+    const startClientX = e.clientX;
+    const startClientY = e.clientY;
+    const minWidth = 50; // projector px — never collapse below this
+    const minHeight = 50;
+
+    this.draggingEdge = edge;
+    (e.target as Element).setPointerCapture?.(e.pointerId);
+
+    const onMove = (ev: PointerEvent): void => {
+      const dx = (ev.clientX - startClientX) / scale;
+      const dy = (ev.clientY - startClientY) / scale;
+      const next = { ...startMargins };
+      if (edge === "left") {
+        next.left = clamp(startMargins.left + dx, 0, proj[0] - startMargins.right - minWidth);
+      } else if (edge === "right") {
+        next.right = clamp(startMargins.right - dx, 0, proj[0] - startMargins.left - minWidth);
+      } else if (edge === "top") {
+        next.top = clamp(startMargins.top + dy, 0, proj[1] - startMargins.bottom - minHeight);
+      } else if (edge === "bottom") {
+        next.bottom = clamp(startMargins.bottom - dy, 0, proj[1] - startMargins.top - minHeight);
+      }
+      const pending: PendingMargins = {
+        left: String(Math.round(next.left)),
+        top: String(Math.round(next.top)),
+        right: String(Math.round(next.right)),
+        bottom: String(Math.round(next.bottom)),
+      };
+      this.state.pendingMargins = pending;
+      this.applyPreviewLayout(svg, proj, pending);
+      this.syncInputsFromPending(pending);
+      this.updateWsInfoLive(pending, proj);
+    };
+
+    const onUp = (): void => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      this.draggingEdge = null;
+      this.applyMargins(this.state.pendingMargins!, this.state.showWorkSurfaceOutline);
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
+  private syncInputsFromPending(p: PendingMargins): void {
+    for (const name of ["top", "bottom", "left", "right"] as const) {
+      const input = this.root.querySelector(`input[data-field="${name}"]`) as HTMLInputElement | null;
+      if (input && input.value !== p[name]) input.value = p[name];
+    }
+  }
+
+  private updateWsInfoLive(pending: PendingMargins, proj: [number, number]): void {
+    const node = this.root.querySelector('[data-role="ws-info"]') as HTMLElement | null;
+    if (!node) return;
+    const m = parsePending(pending);
+    const x = Math.max(0, m.left);
+    const y = Math.max(0, m.top);
+    const width = Math.max(1, proj[0] - m.left - m.right);
+    const height = Math.max(1, proj[1] - m.top - m.bottom);
+    node.textContent = `${width} × ${height} px @ (${x}, ${y})`;
+  }
+
+  private applyMargins(pending: PendingMargins, showOutline: boolean): void {
+    const proj = this.state.projector;
+    if (!proj) return;
+    const m = parsePending(pending);
+    const x = Math.max(0, m.left);
+    const y = Math.max(0, m.top);
+    const width = Math.max(1, proj[0] - m.left - m.right);
+    const height = Math.max(1, proj[1] - m.top - m.bottom);
+    this.ws.send({ type: "set_work_surface", x, y, width, height, show_outline: showOutline });
+  }
+
+  private computeMargins(
+    proj: [number, number],
+    ws: WorkSurface | null,
+  ): { left: number; top: number; right: number; bottom: number } {
+    if (!ws) return { left: 0, top: 0, right: 0, bottom: 0 };
+    return {
+      left: ws.x,
+      top: ws.y,
+      right: proj[0] - ws.x - ws.width,
+      bottom: proj[1] - ws.y - ws.height,
+    };
+  }
+
+  private renderCameraCard(): HTMLElement {
+    const card = el("div", "card");
+    card.appendChild(el("h2", "", "Camera"));
+
+    const row = el("div", "row");
+    if (this.state.cameraOpen && this.state.cameraIndex !== null) {
+      row.appendChild(el("span", "pill ok", "Live"));
+      const current = this.state.cameras.find((c) => c.index === this.state.cameraIndex);
+      const label = current ? `${current.name} (index ${current.index})` : `Camera ${this.state.cameraIndex}`;
+      row.appendChild(el("div", "v", label));
+    } else if (this.state.switchingCamera) {
+      row.appendChild(el("span", "pill warn", "Opening…"));
+    } else {
+      row.appendChild(el("span", "pill muted", "Closed"));
+      row.appendChild(el("div", "v", "no camera selected"));
+    }
+    card.appendChild(row);
+
+    if (this.state.cameraError) {
+      card.appendChild(el("div", "help warn-text", `Error: ${this.state.cameraError}`));
+    }
+
+    if (this.state.cameraOpen) {
+      const preview = el("div", "camera-preview");
+      const img = el("img");
+      img.src = `${SERVER_HTTP}/camera/preview.mjpg?t=${Date.now()}`;
+      img.alt = "Camera preview";
+      preview.appendChild(img);
+      card.appendChild(preview);
+    }
+
+    if (this.state.cameras.length === 0) {
+      card.appendChild(
+        el(
+          "div",
+          "help",
+          this.state.cameraError
+            ? "Could not list cameras."
+            : "No cameras detected. Plug in a camera and click Refresh.",
+        ),
+      );
+    } else {
+      const list = el("div", "displays");
+      for (const c of this.state.cameras) {
+        list.appendChild(this.renderCameraRow(c));
+      }
+      card.appendChild(list);
+    }
+
+    const actions = el("div", "row");
+    const refresh = el("button", "", "Refresh list");
+    refresh.addEventListener("click", () => void this.fetchCameras());
+    actions.appendChild(refresh);
+
+    if (this.state.cameraOpen) {
+      const closeBtn = el("button", "", "Close camera");
+      closeBtn.addEventListener("click", () => this.switchCamera(null));
+      actions.appendChild(closeBtn);
+    }
+    card.appendChild(actions);
+
+    return card;
+  }
+
+  private renderCameraRow(c: CameraInfo): HTMLElement {
+    const isSelected = c.index === this.state.cameraIndex && this.state.cameraOpen;
+    const row = el("div", "display-row");
+    const info = el("div", "display-info");
+    info.appendChild(el("div", "display-name", c.name));
+    info.appendChild(el("div", "display-meta", `index ${c.index}`));
+    row.appendChild(info);
+
+    const btn = el("button", isSelected ? "active" : "primary", isSelected ? "Active" : "Use");
+    btn.disabled = isSelected || this.state.switchingCamera;
+    btn.addEventListener("click", () => this.switchCamera(c.index));
+    row.appendChild(btn);
+    return row;
+  }
+
+  private renderModeCard(): HTMLElement {
+    const card = el("div", "card");
+    card.appendChild(el("h2", "", "Mode"));
+    const row = el("div", "row");
+
+    const idleBtn = el("button", this.state.mode === "idle" ? "active" : "", "Idle");
+    idleBtn.addEventListener("click", () => this.ws.send({ type: "set_mode", mode: "idle" }));
+    row.appendChild(idleBtn);
+
+    const calBtn = el("button", this.state.mode === "calibrate" ? "active" : "primary", "Calibrate");
+    calBtn.disabled = !this.state.projector;
+    calBtn.addEventListener("click", () => this.ws.send({ type: "start_calibration" }));
+    row.appendChild(calBtn);
+
+    const trackBtn = el("button", this.state.mode === "track" ? "active" : "", "Track");
+    trackBtn.disabled = !this.state.calibration;
+    trackBtn.addEventListener("click", () => this.ws.send({ type: "set_mode", mode: "track" }));
+    row.appendChild(trackBtn);
+
+    card.appendChild(row);
+
+    if (!this.state.projector) {
+      card.appendChild(el("div", "help", "Open the projector window above before calibrating."));
+    } else if (!this.state.calibration) {
+      card.appendChild(el("div", "help", "Track is disabled until calibration has been completed at least once."));
+    }
+    return card;
+  }
+
+  private renderCalibrationCard(): HTMLElement {
+    const card = el("div", "card");
+    card.appendChild(el("h2", "", "Calibration"));
+
+    const status = el("div", "row");
+    if (this.state.capturedMarkers === 4) {
+      status.appendChild(el("span", "pill ok", "All 4 markers detected"));
+    } else {
+      status.appendChild(el("span", "pill warn", `Detecting markers… (${this.state.capturedMarkers}/4)`));
+    }
+    card.appendChild(status);
+
+    card.appendChild(
+      el(
+        "div",
+        "help",
+        "On the mat, measure the distance between the centers of the top-left and top-right projected markers. Type the value in millimeters and click Save.",
+      ),
+    );
+
+    const inputRow = el("div", "row");
+    const input = el("input") as HTMLInputElement;
+    input.type = "number";
+    input.step = "0.1";
+    input.placeholder = "horizontal mm";
+    input.value = this.pendingMm;
+    input.addEventListener("input", () => {
+      this.pendingMm = input.value;
+    });
+    inputRow.appendChild(input);
+
+    const saveBtn = el("button", "primary", "Save");
+    saveBtn.disabled = this.state.capturedMarkers < 4;
+    saveBtn.addEventListener("click", () => {
+      const v = parseFloat(this.pendingMm);
+      if (Number.isFinite(v) && v > 0) {
+        this.ws.send({ type: "finish_calibration", horizontal_mm: v });
+        this.pendingMm = "";
+      }
+    });
+    inputRow.appendChild(saveBtn);
+    card.appendChild(inputRow);
+
+    return card;
+  }
+
+  private renderTrackCard(): HTMLElement {
+    const card = el("div", "card");
+    card.appendChild(el("h2", "", "Tracked objects"));
+    const objects = el("div", "objects");
+
+    if (this.state.detections.length === 0) {
+      objects.appendChild(el("div", "empty", "No objects detected. Place an ArUco-tagged item on the mat."));
+    } else {
+      const table = el("table");
+      for (const obj of this.state.detections) {
+        const tr = el("tr");
+        const id = el("td", "id", `#${obj.marker_id}`);
+        const center = el(
+          "td",
+          "",
+          `(${obj.center_mm[0].toFixed(1)}, ${obj.center_mm[1].toFixed(1)}) mm`,
+        );
+        const angle = el("td", "", `${obj.angle_deg.toFixed(1)}°`);
+        tr.appendChild(id);
+        tr.appendChild(center);
+        tr.appendChild(angle);
+        table.appendChild(tr);
+      }
+      objects.appendChild(table);
+    }
+    card.appendChild(objects);
+    return card;
+  }
+
+  private connectionPill(): HTMLElement {
+    if (this.state.connection === "open") return el("span", "pill ok", "Connected");
+    if (this.state.connection === "connecting") return el("span", "pill muted", "Connecting…");
+    return el("span", "pill error", "Disconnected — retrying");
+  }
+
+  private modePill(): HTMLElement {
+    const cls = this.state.mode === "track" ? "pill ok" : this.state.mode === "calibrate" ? "pill warn" : "pill muted";
+    return el("span", cls, this.state.mode);
+  }
+}
+
+function el<K extends keyof HTMLElementTagNameMap>(tag: K, className = "", text?: string): HTMLElementTagNameMap[K] {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function parsePending(p: PendingMargins): { left: number; top: number; right: number; bottom: number } {
+  const safe = (v: string) => {
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  };
+  return { left: safe(p.left), top: safe(p.top), right: safe(p.right), bottom: safe(p.bottom) };
+}
+
+function clamp(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
+}
+
+function formatRelativeTime(ts: number): string {
+  const seconds = Date.now() / 1000 - ts;
+  if (seconds < 60) return "just now";
+  if (seconds < 3600) return `${Math.round(seconds / 60)} min ago`;
+  if (seconds < 86400) return `${Math.round(seconds / 3600)} h ago`;
+  return `${Math.round(seconds / 86400)} d ago`;
+}
+
+const root = document.getElementById("root");
+if (!root) throw new Error("no #root in control.html");
+new ControlApp(root).start();
