@@ -251,7 +251,9 @@ class AppState:
         except FileNotFoundError as e:
             log.warning("hand detection disabled: %s", e)
         self.calibration: Calibration | None = load_calibration(CALIBRATION_PATH)
-        self.mode: Mode = "idle"
+        # If we've been calibrated before, jump straight into tracking — recalibration
+        # is rare and the user almost always wants the overlay live on startup.
+        self.mode: Mode = "track" if self.calibration is not None else "idle"
         self.projector_dims: tuple[int, int] | None = None
         self.work_surface: WorkSurface | None = ws_persist.load(WORK_SURFACE_PATH)
         self.camera_index: int | None = None
