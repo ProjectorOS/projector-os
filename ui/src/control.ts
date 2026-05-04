@@ -156,6 +156,11 @@ class ControlApp {
         this.state.showWorkSurfaceOutline = ev.show_work_surface_outline;
         this.state.cameraIndex = ev.camera_index;
         this.state.cameraOpen = ev.camera_open;
+        // If the input was created before hello arrived, back-fill it now.
+        if (ev.calibration && !this.pendingMm) {
+          this.pendingMm = formatMmForInput(ev.calibration.mat_width_mm);
+          if (this.measurementInput) this.measurementInput.value = this.pendingMm;
+        }
         break;
       case "mode_changed":
         this.state.mode = ev.mode;
@@ -1120,6 +1125,11 @@ class ControlApp {
 
   private getMeasurementInput(): HTMLInputElement {
     if (!this.measurementInput) {
+      // Pre-fill from the previously-saved calibration so the user doesn't have to
+      // retype the same number after a restart. They can still edit before saving.
+      if (!this.pendingMm && this.state.calibration) {
+        this.pendingMm = formatMmForInput(this.state.calibration.mat_width_mm);
+      }
       const input = document.createElement("input");
       input.type = "text";
       input.inputMode = "decimal";
@@ -1230,6 +1240,15 @@ function parsePending(p: PendingMargins): { left: number; top: number; right: nu
 
 function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
+}
+
+/**
+ * Format a millimeter value for display in the measurement input. Strips trailing zeros
+ * and floating-point noise so a value typed as "305" round-trips back as "305", and a
+ * value typed as "12 in" (= 304.8 mm) round-trips as "304.8".
+ */
+function formatMmForInput(mm: number): string {
+  return String(parseFloat(mm.toFixed(2)));
 }
 
 /**
