@@ -84,19 +84,33 @@ GLUE_PAD_MM = 15
 GLUE_TIMEOUT_S = 2.0
 # MediaPipe Hand fingertip landmark indices: thumb, index, middle, ring, pinky.
 FINGERTIP_LANDMARK_INDICES = (4, 8, 12, 16, 20)
+# For each fingertip, the proximal landmark we use as the angle baseline. Long lever
+# arms (whole-finger from MCP/CMC to tip) keep the measured angle stable against
+# landmark jitter and follow the wrist's rotation naturally.
+FINGERTIP_TO_BASE: dict[int, int] = {
+    4: 1,    # thumb: CMC → tip
+    8: 5,    # index: MCP → tip
+    12: 9,   # middle
+    16: 13,  # ring
+    20: 17,  # pinky
+}
 
 
 @dataclass
 class GlueState:
-    """A marker is currently being dragged by this fingertip.
+    """A marker is currently being dragged by a fingertip.
 
-    The translation each frame is `current_fingertip + offset`, so cumulative
-    drift can't accumulate — the offset is fixed at glue creation time.
+    Frozen baseline: the marker pose, fingertip position, and finger angle at the
+    moment the glue formed. Each frame we recompute the marker's position from
+    these baselines plus the current fingertip + finger angle — never chaining
+    incremental updates, so cumulative drift can't accumulate.
     """
 
     handedness: str  # "Left" | "Right" (user's POV — see HandDetector)
     landmark_idx: int  # which fingertip (one of FINGERTIP_LANDMARK_INDICES)
-    offset_from_fingertip_mm: tuple[float, float]  # marker_center - fingertip at glue time
+    frozen_obj: DetectedObject  # marker pose at glue time
+    frozen_fingertip_mm: tuple[float, float]
+    frozen_finger_angle_rad: float  # base→tip angle at glue time
     created_ts: float
 
 
@@ -142,44 +156,88 @@ def _padded_corners_mm(obj: DetectedObject, pad_mm: float) -> np.ndarray:
     return np.array(out, dtype=np.float32)
 
 
-def _translate_object(obj: DetectedObject, dx: float, dy: float) -> DetectedObject:
-    return DetectedObject(
-        marker_id=obj.marker_id,
-        corners_mm=[[c[0] + dx, c[1] + dy] for c in obj.corners_mm],
-        center_mm=[obj.center_mm[0] + dx, obj.center_mm[1] + dy],
-        angle_deg=obj.angle_deg,
-    )
+def _finger_angle_rad(hand: DetectedHand, tip_idx: int, base_idx: int) -> float:
+    tx, ty = hand.landmarks_mm[tip_idx]
+    bx, by = hand.landmarks_mm[base_idx]
+    return math.atan2(ty - by, tx - bx)
+
+
+def _angle_delta_rad(current: float, baseline: float) -> float:
+    """Shortest signed rotation from baseline to current, in (-pi, pi]. Handles
+    the atan2 wraparound — without this, a rotation past +/-pi would flip sign
+    and cause the marker to spin the long way around."""
+    delta = (current - baseline) % (2 * math.pi)
+    if delta > math.pi:
+        delta -= 2 * math.pi
+    return delta
 
 
 def _find_fingertip_over(
     hands: list[DetectedHand], obj: DetectedObject, pad_mm: float
-) -> tuple[str, int, tuple[float, float]] | None:
+) -> tuple[str, int, tuple[float, float], float] | None:
     """Find the fingertip closest to the marker center that lies inside the padded
-    quad. Returns (handedness, landmark_idx, position_mm) or None."""
+    quad. Returns (handedness, tip_idx, tip_mm, finger_angle_rad) or None."""
     quad = _padded_corners_mm(obj, pad_mm)
     cx, cy = obj.center_mm
-    best: tuple[str, int, tuple[float, float], float] | None = None
+    best: tuple[str, int, tuple[float, float], float, float] | None = None
     for hand in hands:
-        for idx in FINGERTIP_LANDMARK_INDICES:
-            x, y = hand.landmarks_mm[idx]
+        for tip_idx in FINGERTIP_LANDMARK_INDICES:
+            x, y = hand.landmarks_mm[tip_idx]
             if cv2.pointPolygonTest(quad, (float(x), float(y)), False) < 0:
                 continue
             d2 = (x - cx) ** 2 + (y - cy) ** 2
-            if best is None or d2 < best[3]:
-                best = (hand.handedness, idx, (float(x), float(y)), d2)
+            if best is not None and d2 >= best[4]:
+                continue
+            angle = _finger_angle_rad(hand, tip_idx, FINGERTIP_TO_BASE[tip_idx])
+            best = (hand.handedness, tip_idx, (float(x), float(y)), angle, d2)
     if best is None:
         return None
-    return best[0], best[1], best[2]
+    return best[0], best[1], best[2], best[3]
 
 
-def _find_fingertip_by_id(
-    hands: list[DetectedHand], handedness: str, landmark_idx: int
-) -> tuple[float, float] | None:
+def _find_finger_pose(
+    hands: list[DetectedHand], handedness: str, tip_idx: int
+) -> tuple[tuple[float, float], float] | None:
+    """Returns (tip_pos_mm, finger_angle_rad) for the matching hand, or None."""
+    base_idx = FINGERTIP_TO_BASE[tip_idx]
     for hand in hands:
         if hand.handedness == handedness:
-            x, y = hand.landmarks_mm[landmark_idx]
-            return (float(x), float(y))
+            x, y = hand.landmarks_mm[tip_idx]
+            return ((float(x), float(y)), _finger_angle_rad(hand, tip_idx, base_idx))
     return None
+
+
+def _glued_object(
+    frozen_obj: DetectedObject,
+    frozen_fingertip_mm: tuple[float, float],
+    new_fingertip_mm: tuple[float, float],
+    delta_rad: float,
+) -> DetectedObject:
+    """Compute the marker's current pose from frozen state + finger movement.
+
+    The offset from fingertip to marker center, and the corners relative to that
+    center, are both rotated by delta_rad. Each frame derives from the frozen
+    baseline (not from last frame's pose) so rotation can't accumulate drift."""
+    cos_d = math.cos(delta_rad)
+    sin_d = math.sin(delta_rad)
+    fcx, fcy = frozen_obj.center_mm
+    fox = fcx - frozen_fingertip_mm[0]
+    foy = fcy - frozen_fingertip_mm[1]
+    new_cx = new_fingertip_mm[0] + cos_d * fox - sin_d * foy
+    new_cy = new_fingertip_mm[1] + sin_d * fox + cos_d * foy
+    new_corners: list[list[float]] = []
+    for x, y in frozen_obj.corners_mm:
+        rx = x - fcx
+        ry = y - fcy
+        new_corners.append(
+            [new_cx + cos_d * rx - sin_d * ry, new_cy + sin_d * rx + cos_d * ry]
+        )
+    return DetectedObject(
+        marker_id=frozen_obj.marker_id,
+        corners_mm=new_corners,
+        center_mm=[new_cx, new_cy],
+        angle_deg=frozen_obj.angle_deg + math.degrees(delta_rad),
+    )
 
 
 class AppState:
@@ -525,22 +583,22 @@ class AppState:
 
                     # 2. For tracked markers without a fresh detection: maintain or
                     # establish a glue. Either path keeps last_seen_ts current so the
-                    # grace-period filter in step 3 doesn't drop the entry.
+                    # grace-period filter in step 3 doesn't drop the entry. Pose each
+                    # frame is derived from the glue's frozen baseline + current
+                    # fingertip + finger angle, so rotation/translation can't drift.
                     for mid, t in self._tracked_objects.items():
                         if mid in fresh_ids:
                             continue
                         if t.glue is None:
                             match = _find_fingertip_over(hands, t.last_obj, GLUE_PAD_MM)
                             if match is not None:
-                                handedness, idx, fingertip = match
-                                cx, cy = t.last_obj.center_mm
+                                handedness, idx, fingertip, finger_angle = match
                                 t.glue = GlueState(
                                     handedness=handedness,
                                     landmark_idx=idx,
-                                    offset_from_fingertip_mm=(
-                                        cx - fingertip[0],
-                                        cy - fingertip[1],
-                                    ),
+                                    frozen_obj=t.last_obj,
+                                    frozen_fingertip_mm=fingertip,
+                                    frozen_finger_angle_rad=finger_angle,
                                     created_ts=now,
                                 )
                                 t.last_seen_ts = now
@@ -548,23 +606,23 @@ class AppState:
                             if now - t.glue.created_ts > GLUE_TIMEOUT_S:
                                 t.glue = None
                             else:
-                                fingertip = _find_fingertip_by_id(
+                                pose = _find_finger_pose(
                                     hands, t.glue.handedness, t.glue.landmark_idx
                                 )
-                                if fingertip is None:
+                                if pose is None:
                                     t.glue = None
                                 else:
-                                    new_cx = (
-                                        fingertip[0]
-                                        + t.glue.offset_from_fingertip_mm[0]
+                                    tip_mm, finger_angle = pose
+                                    delta_rad = _angle_delta_rad(
+                                        finger_angle,
+                                        t.glue.frozen_finger_angle_rad,
                                     )
-                                    new_cy = (
-                                        fingertip[1]
-                                        + t.glue.offset_from_fingertip_mm[1]
+                                    t.last_obj = _glued_object(
+                                        t.glue.frozen_obj,
+                                        t.glue.frozen_fingertip_mm,
+                                        tip_mm,
+                                        delta_rad,
                                     )
-                                    dx = new_cx - t.last_obj.center_mm[0]
-                                    dy = new_cy - t.last_obj.center_mm[1]
-                                    t.last_obj = _translate_object(t.last_obj, dx, dy)
                                     t.last_seen_ts = now
 
                     # 3. Apply grace period — drop entries we haven't seen recently
