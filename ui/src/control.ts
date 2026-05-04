@@ -123,6 +123,9 @@ class ControlApp {
   // UI prefs persisted to localStorage (per browser).
   private workSurfaceCollapsed = readBool("workSurfaceCollapsed", false);
   private previewRotation: 0 | 180 = readNumber("previewRotation", 0) === 180 ? 180 : 0;
+  // When true, the camera card hides the preview, heartbeat, and frame-stats line.
+  // The camera itself stays open server-side; this is purely a UI declutter toggle.
+  private previewHidden = readBool("previewHidden", false);
 
   constructor(private readonly root: HTMLElement) {
     this.ws = new WsClient({
@@ -798,7 +801,11 @@ class ControlApp {
 
     if (this.state.cameraOpen && this.state.cameraIndex !== null && !this.state.switchingCamera) {
       // Live: preview is the prominent thing, plus a thin status row + actions.
-      card.appendChild(this.renderCameraPreview(this.state.mode === "calibrate"));
+      // The camera stays running on the server when the preview is hidden — this is
+      // a UI declutter toggle, not a camera shutdown.
+      if (!this.previewHidden) {
+        card.appendChild(this.renderCameraPreview(this.state.mode === "calibrate"));
+      }
 
       const status = el("div", "row");
       status.appendChild(el("span", "pill ok", "Live"));
@@ -807,7 +814,9 @@ class ControlApp {
       status.appendChild(el("div", "v", label));
       card.appendChild(status);
 
-      card.appendChild(this.renderHeartbeatRow());
+      if (!this.previewHidden) {
+        card.appendChild(this.renderHeartbeatRow());
+      }
 
       const actions = el("div", "row");
       const switchBtn = el("button", "", "Switch camera");
@@ -817,22 +826,30 @@ class ControlApp {
       });
       actions.appendChild(switchBtn);
 
-      const rotateBtn = el(
+      if (!this.previewHidden) {
+        const rotateBtn = el(
+          "button",
+          "",
+          this.previewRotation === 180 ? "Rotate preview (180°)" : "Rotate preview",
+        );
+        rotateBtn.title = "Cycle preview rotation. Cosmetic only — does not affect calibration.";
+        rotateBtn.addEventListener("click", () => {
+          this.previewRotation = this.previewRotation === 0 ? 180 : 0;
+          writeNumber("previewRotation", this.previewRotation);
+          this.render();
+        });
+        actions.appendChild(rotateBtn);
+      }
+
+      const previewToggle = el(
         "button",
         "",
-        this.previewRotation === 180 ? "Rotate preview (180°)" : "Rotate preview",
+        this.previewHidden ? "Show preview" : "Close preview",
       );
-      rotateBtn.title = "Cycle preview rotation. Cosmetic only — does not affect calibration.";
-      rotateBtn.addEventListener("click", () => {
-        this.previewRotation = this.previewRotation === 0 ? 180 : 0;
-        writeNumber("previewRotation", this.previewRotation);
-        this.render();
-      });
-      actions.appendChild(rotateBtn);
-
-      const closeBtn = el("button", "", "Close camera");
-      closeBtn.addEventListener("click", () => this.switchCamera(null));
-      actions.appendChild(closeBtn);
+      previewToggle.title =
+        "Hides the preview + heartbeat without closing the camera. The server keeps capturing frames.";
+      previewToggle.addEventListener("click", () => this.setPreviewHidden(!this.previewHidden));
+      actions.appendChild(previewToggle);
       card.appendChild(actions);
     }
 
@@ -1183,6 +1200,21 @@ class ControlApp {
     return card;
   }
 
+
+  private setPreviewHidden(hidden: boolean): void {
+    this.previewHidden = hidden;
+    writeBool("previewHidden", hidden);
+    if (hidden && this.cameraPreviewImg) {
+      // Abort the in-flight MJPEG request so we stop pulling frame bytes over the
+      // network. Setting src to "" is the standard way to cancel an <img> load in
+      // browsers; we then drop the reference so the next "Show preview" lazily creates
+      // a fresh element with the stream URL.
+      this.cameraPreviewImg.src = "";
+      this.cameraPreviewImg.remove();
+      this.cameraPreviewImg = null;
+    }
+    this.render();
+  }
 
   private getMeasurementInput(): HTMLInputElement {
     if (!this.measurementInput) {

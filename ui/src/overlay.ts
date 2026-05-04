@@ -60,6 +60,7 @@ export class TrackedObjectOverlay {
     const PAD_MM = 15; // padding on the bounding box outside the marker corners
     const ARROW_OUTSIDE_MM = 15; // how far past the padded box the arrow extends
     const LABEL_GAP_MM = 5; // distance from padded box edge to the ID label
+    const LABEL_X_OFFSET_MM = -15; // shift label left so it doesn't overlap a straight-up arrow
     // Server-side angle_deg is the direction of the marker's TL→TR edge. Users think of
     // 0° as the marker "pointing forward" (perpendicular to that edge, away from the
     // marker body), so shift the rendered arrow by -90° to match that convention.
@@ -124,10 +125,12 @@ export class TrackedObjectOverlay {
         );
         group.appendChild(makeArrowhead(arrowStart, arrowTip));
 
-        // Label sits LABEL_GAP_MM above the padded box, centered horizontally on the
-        // marker. Computed in mat coordinates so the gap is physically consistent.
+        // Label sits LABEL_GAP_MM above the padded box, shifted horizontally by
+        // LABEL_X_OFFSET_MM so it doesn't overlap the arrow when angle = 0° (which
+        // points straight up). Computed in mat coordinates so the gap is physically
+        // consistent regardless of viewing angle.
         const labelMm: [number, number] = [
-          cx,
+          cx + LABEL_X_OFFSET_MM,
           cy - halfEdge - PAD_MM - LABEL_GAP_MM,
         ];
         const labelProj = applyHomography(h, labelMm[0], labelMm[1]);
