@@ -204,6 +204,36 @@
         transform: rotate(180deg);
         transform-origin: center;
       }
+      .heartbeat-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 6px;
+        font-size: 12px;
+        font-variant-numeric: tabular-nums;
+        color: var(--muted);
+      }
+      .heartbeat-text { color: var(--fg); opacity: 0.85; }
+      .heartbeat-text.muted { color: var(--muted); opacity: 1; }
+      .heartbeat {
+        display: inline-block;
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        flex-shrink: 0;
+      }
+      .heartbeat.alive {
+        background: var(--accent);
+        animation: heartbeat-pulse 1s ease-in-out infinite;
+      }
+      .heartbeat.stale {
+        background: var(--error);
+        opacity: 0.8;
+      }
+      @keyframes heartbeat-pulse {
+        0%, 100% { opacity: 0.5; box-shadow: 0 0 0 0 rgba(74, 222, 128, 0); }
+        50% { opacity: 1; box-shadow: 0 0 0 4px rgba(74, 222, 128, 0.25); }
+      }
     </style>
   </head>
   <body>

@@ -47,17 +47,28 @@ export type ServerEvent =
   | { type: "mode_changed"; mode: Mode }
   | { type: "detections"; objects: DetectedObject[]; ts: number }
   | { type: "calibration_updated"; calibration: Calibration }
-  | { type: "calibration_prompt"; markers: CalibrationMarker[] }
+  | { type: "calibration_prompt"; markers: CalibrationMarker[]; marker_size_px: number }
   | {
       type: "calibration_captured";
       detected_marker_ids: number[];
       detected_corners_cam: [number, number][][];
       frame_width: number;
       frame_height: number;
+      rejected_count: number;
     }
   | { type: "projector_registered"; proj_width: number; proj_height: number }
   | { type: "work_surface_updated"; work_surface: WorkSurface; show_outline: boolean }
-  | { type: "camera_changed"; camera_index: number | null; camera_open: boolean; error: string | null };
+  | { type: "camera_changed"; camera_index: number | null; camera_open: boolean; error: string | null }
+  | {
+      type: "frame_stats";
+      mode: Mode;
+      camera_open: boolean;
+      frame_index: number;
+      fps: number;
+      last_frame_age_ms: number;
+      detector_runs: number;
+      last_detected_count: number;
+    };
 
 export type ClientCommand =
   | { type: "set_mode"; mode: Mode }

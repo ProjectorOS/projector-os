@@ -82,7 +82,7 @@ class ProjectorApp {
         this.calibration = ev.calibration;
         break;
       case "calibration_prompt":
-        this.calibrationOverlay.show(ev.markers);
+        this.calibrationOverlay.show(ev.markers, ev.marker_size_px);
         break;
       case "work_surface_updated":
         this.workSurface = ev.work_surface;

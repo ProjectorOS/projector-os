@@ -38,8 +38,17 @@ log = logging.getLogger(__name__)
 
 CALIBRATION_DICT = cv2.aruco.DICT_4X4_50
 CALIBRATION_MARKER_IDS = [10, 11, 12, 13]  # TL, TR, BR, BL — distinct from object IDs (0..9)
-CALIBRATION_INSET_FRAC = 0.10
-CALIBRATION_MARKER_SIZE_PX = 200
+
+# Single source of truth for marker pixel sizing. Both the PNG generator and the layout
+# math need this. The UI receives the total size in CalibrationPromptEvent so it
+# doesn't have to duplicate the constant.
+CALIBRATION_MARKER_INNER_PX = 200
+CALIBRATION_MARKER_QUIET_ZONE_PX = 50
+CALIBRATION_MARKER_TOTAL_PX = CALIBRATION_MARKER_INNER_PX + 2 * CALIBRATION_MARKER_QUIET_ZONE_PX
+
+# Small extra gap between the marker's white edge and the work-surface boundary so the
+# marker doesn't sit flush against the dashed outline.
+CALIBRATION_EDGE_MARGIN_PX = 10
 
 
 @dataclass
@@ -47,22 +56,33 @@ class CalibrationCapture:
     """Result of detecting projected calibration markers in a camera frame."""
 
     cam_corners_by_id: dict[int, np.ndarray]  # marker_id → (4, 2) in camera pixels
+    rejected_count: int = 0  # quads detector found but couldn't decode (debug signal)
 
 
 def make_projection_layout(ws: WorkSurface) -> list[CalibrationMarker]:
     """Return where the 4 calibration markers should be drawn in projector pixels.
 
-    Markers are inset 10% inside the *work surface* (not the full projector), so they
-    land on the actual mat when the projection overshoots it.
+    Markers are positioned so the *entire* marker image (200×200 ArUco + 50px white
+    quiet zone on each side = 300×300) fits inside the work surface, with a small extra
+    margin so it doesn't sit flush against the work-surface outline.
+
+    For very small work surfaces (smaller than the markers themselves) the inset shrinks
+    to whatever fits, and markers may overlap — calibration in that regime won't be
+    accurate but at least won't crash.
 
     Order: TL=10, TR=11, BR=12, BL=13. Coordinates are the *center* of each marker.
     """
-    inset_x = ws.width * CALIBRATION_INSET_FRAC
-    inset_y = ws.height * CALIBRATION_INSET_FRAC
-    left = ws.x + inset_x
-    top = ws.y + inset_y
-    right = ws.x + ws.width - inset_x
-    bottom = ws.y + ws.height - inset_y
+    half = CALIBRATION_MARKER_TOTAL_PX / 2
+    inset = half + CALIBRATION_EDGE_MARGIN_PX
+    if ws.width < 2 * inset:
+        inset = max(0, ws.width / 2)
+    if ws.height < 2 * inset:
+        inset = min(inset, max(0, ws.height / 2))
+
+    left = ws.x + inset
+    top = ws.y + inset
+    right = ws.x + ws.width - inset
+    bottom = ws.y + ws.height - inset
     return [
         CalibrationMarker(marker_id=10, proj_x=left, proj_y=top),
         CalibrationMarker(marker_id=11, proj_x=right, proj_y=top),
@@ -73,16 +93,25 @@ def make_projection_layout(ws: WorkSurface) -> list[CalibrationMarker]:
 
 def detect_projected_markers(frame: np.ndarray) -> CalibrationCapture:
     aruco_dict = cv2.aruco.getPredefinedDictionary(CALIBRATION_DICT)
-    detector = cv2.aruco.ArucoDetector(aruco_dict, cv2.aruco.DetectorParameters())
-    corners, ids, _ = detector.detectMarkers(frame)
+    params = cv2.aruco.DetectorParameters()
+    # Tuned for projector-rendered markers (soft edges from projection + camera blur):
+    # - subpixel corner refinement gives sub-pixel accuracy on fuzzy edges
+    # - lower perimeter floor accepts smaller markers in the camera frame
+    # - looser polygon-approx accuracy tolerates non-perfectly-rectilinear projections
+    params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    params.minMarkerPerimeterRate = 0.02
+    params.polygonalApproxAccuracyRate = 0.05
+    detector = cv2.aruco.ArucoDetector(aruco_dict, params)
+    corners, ids, rejected = detector.detectMarkers(frame)
 
     out: dict[int, np.ndarray] = {}
+    rejected_count = len(rejected) if rejected is not None else 0
     if ids is None:
-        return CalibrationCapture(cam_corners_by_id=out)
+        return CalibrationCapture(cam_corners_by_id=out, rejected_count=rejected_count)
     for marker_corners, marker_id in zip(corners, ids.flatten()):
         if int(marker_id) in CALIBRATION_MARKER_IDS:
             out[int(marker_id)] = marker_corners.reshape(4, 2)
-    return CalibrationCapture(cam_corners_by_id=out)
+    return CalibrationCapture(cam_corners_by_id=out, rejected_count=rejected_count)
 
 
 def average_captures(captures: list[CalibrationCapture]) -> CalibrationCapture:
@@ -96,7 +125,7 @@ def average_captures(captures: list[CalibrationCapture]) -> CalibrationCapture:
     for mid in common_ids:
         stack = np.stack([c.cam_corners_by_id[mid] for c in captures], axis=0)
         averaged[mid] = stack.mean(axis=0)
-    return CalibrationCapture(cam_corners_by_id=averaged)
+    return CalibrationCapture(cam_corners_by_id=averaged, rejected_count=0)
 
 
 def compute_calibration(

@@ -77,6 +77,7 @@ class CalibrationPromptEvent(BaseModel):
 
     type: Literal["calibration_prompt"] = "calibration_prompt"
     markers: list[CalibrationMarker]
+    marker_size_px: int  # how many projector pixels each marker image (incl. white quiet zone) occupies
 
 
 class CalibrationCapturedEvent(BaseModel):
@@ -92,6 +93,7 @@ class CalibrationCapturedEvent(BaseModel):
     detected_corners_cam: list[list[list[float]]] = []
     frame_width: int = 0
     frame_height: int = 0
+    rejected_count: int = 0  # quads found but not decoded — useful when detected count = 0
 
 
 class ProjectorRegisteredEvent(BaseModel):
@@ -115,6 +117,21 @@ class CameraChangedEvent(BaseModel):
     error: str | None = None
 
 
+class FrameStatsEvent(BaseModel):
+    """Heartbeat broadcast at ~1 Hz so the UI can show that the frame loop is alive
+    and how it's doing (FPS, frame index, last frame age). Fires regardless of mode
+    or camera state — so even with no camera we still get a pulse."""
+
+    type: Literal["frame_stats"] = "frame_stats"
+    mode: Mode
+    camera_open: bool
+    frame_index: int
+    fps: float
+    last_frame_age_ms: int  # -1 if no frame ever read
+    detector_runs: int
+    last_detected_count: int
+
+
 ServerEvent = Union[
     HelloEvent,
     ModeChangedEvent,
@@ -125,6 +142,7 @@ ServerEvent = Union[
     ProjectorRegisteredEvent,
     WorkSurfaceUpdatedEvent,
     CameraChangedEvent,
+    FrameStatsEvent,
 ]
 
 

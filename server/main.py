@@ -18,6 +18,9 @@ from server import preferences as prefs_persist
 from server import work_surface as ws_persist
 from server.bus import Bus
 from server.calibration import (
+    CALIBRATION_MARKER_INNER_PX,
+    CALIBRATION_MARKER_QUIET_ZONE_PX,
+    CALIBRATION_MARKER_TOTAL_PX,
     average_captures,
     compute_calibration,
     detect_projected_markers,
@@ -37,6 +40,7 @@ from server.protocol import (
     CalibrationUpdatedEvent,
     CameraChangedEvent,
     DetectionsEvent,
+    FrameStatsEvent,
     HelloEvent,
     Mode,
     ModeChangedEvent,
@@ -73,6 +77,13 @@ class AppState:
         self._calibration_proj_h: int = 0
         self._calibration_captures: list = []
         self._loop_task: asyncio.Task | None = None
+        self._heartbeat_task: asyncio.Task | None = None
+        # Frame-loop instrumentation (used by the heartbeat broadcast).
+        self._frame_index = 0
+        self._last_frame_ts = 0.0
+        self._fps = 0.0
+        self._detector_runs = 0
+        self._last_detected_count = 0
 
     async def start(self) -> None:
         # Camera: env var wins for one-off overrides; otherwise restore the saved index.
@@ -88,6 +99,7 @@ class AppState:
             await self._open_camera(self.preferences.camera_index)
 
         self._loop_task = asyncio.create_task(self._run_loop(), name="frame-loop")
+        self._heartbeat_task = asyncio.create_task(self._heartbeat(), name="heartbeat")
 
         # Projector: re-launch the kiosk on the previously chosen display, after a short
         # delay so the Vite dev server is reachable.
@@ -153,15 +165,41 @@ class AppState:
         )
 
     async def stop(self) -> None:
-        if self._loop_task:
-            self._loop_task.cancel()
+        for task in (self._loop_task, self._heartbeat_task):
+            if task is None:
+                continue
+            task.cancel()
             try:
-                await self._loop_task
+                await task
             except asyncio.CancelledError:
                 pass
         if self.camera:
             self.camera.close()
         self.launcher.close()
+
+    async def _heartbeat(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(1.0)
+                last_age = -1
+                if self._last_frame_ts > 0:
+                    last_age = int((time.time() - self._last_frame_ts) * 1000)
+                await self.bus.broadcast(
+                    FrameStatsEvent(
+                        mode=self.mode,
+                        camera_open=self.camera is not None,
+                        frame_index=self._frame_index,
+                        fps=round(self._fps, 1),
+                        last_frame_age_ms=last_age,
+                        detector_runs=self._detector_runs,
+                        last_detected_count=self._last_detected_count,
+                    )
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("heartbeat task crashed")
+            raise
 
     async def set_mode(self, mode: Mode) -> None:
         self.mode = mode
@@ -217,7 +255,12 @@ class AppState:
         self._calibration_layout = make_projection_layout(self.work_surface)
         self._calibration_captures.clear()
         await self.set_mode("calibrate")
-        await self.bus.broadcast(CalibrationPromptEvent(markers=self._calibration_layout))
+        await self.bus.broadcast(
+            CalibrationPromptEvent(
+                markers=self._calibration_layout,
+                marker_size_px=CALIBRATION_MARKER_TOTAL_PX,
+            )
+        )
 
     async def finish_calibration(self, horizontal_mm: float) -> None:
         if not self._calibration_captures:
@@ -241,6 +284,7 @@ class AppState:
         track_interval = 1.0 / DETECTION_BROADCAST_HZ
         last_calib_broadcast = 0.0
         calib_interval = 1.0 / 6.0
+        prev_ts = 0.0
         try:
             while True:
                 await asyncio.sleep(0.005)
@@ -251,9 +295,24 @@ class AppState:
                 if latest is None:
                     continue
                 frame, ts = latest
+                if ts == self._last_frame_ts:
+                    # Haven't received a new frame from the grabber yet; don't double-count.
+                    continue
+
+                # Frame stats: cumulative count + EMA of FPS.
+                self._frame_index += 1
+                self._last_frame_ts = ts
+                if prev_ts > 0:
+                    dt = ts - prev_ts
+                    if dt > 0:
+                        inst_fps = 1.0 / dt
+                        self._fps = self._fps * 0.9 + inst_fps * 0.1 if self._fps > 0 else inst_fps
+                prev_ts = ts
 
                 if self.mode == "calibrate":
                     capture = detect_projected_markers(frame)
+                    self._detector_runs += 1
+                    self._last_detected_count = len(capture.cam_corners_by_id)
                     if len(capture.cam_corners_by_id) == 4:
                         self._calibration_captures.append(capture)
                         if len(self._calibration_captures) > 10:
@@ -268,6 +327,7 @@ class AppState:
                                 detected_corners_cam=corners,
                                 frame_width=w,
                                 frame_height=h,
+                                rejected_count=capture.rejected_count,
                             )
                         )
                         last_calib_broadcast = ts
@@ -275,6 +335,8 @@ class AppState:
                     if ts - last_track_broadcast < track_interval:
                         continue
                     objects = self.detector.detect(frame, self.calibration)
+                    self._detector_runs += 1
+                    self._last_detected_count = len(objects)
                     await self.bus.broadcast(DetectionsEvent(objects=objects, ts=now_ts()))
                     last_track_broadcast = ts
         except asyncio.CancelledError:
@@ -384,11 +446,23 @@ async def camera_preview():
 
 @app.get("/markers/{marker_id}.png")
 async def marker_png(marker_id: int) -> Response:
+    """Marker PNG with a white quiet zone around it.
+
+    The ArUco marker itself has a 1-cell BLACK border. If we project that directly onto
+    the projector's black background, the marker's outer edge has zero contrast with the
+    surrounding pixels and the detector can't find the marker at all. Padding with white
+    gives the boundary detector something to lock onto.
+    """
     if not 0 <= marker_id < 50:
         raise HTTPException(status_code=404, detail="marker out of range")
     aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-    img = cv2.aruco.generateImageMarker(aruco_dict, marker_id, 200)
-    ok, png = cv2.imencode(".png", img)
+    marker = cv2.aruco.generateImageMarker(aruco_dict, marker_id, CALIBRATION_MARKER_INNER_PX)
+    canvas = np.full((CALIBRATION_MARKER_TOTAL_PX, CALIBRATION_MARKER_TOTAL_PX), 255, dtype=np.uint8)
+    canvas[
+        CALIBRATION_MARKER_QUIET_ZONE_PX : CALIBRATION_MARKER_QUIET_ZONE_PX + CALIBRATION_MARKER_INNER_PX,
+        CALIBRATION_MARKER_QUIET_ZONE_PX : CALIBRATION_MARKER_QUIET_ZONE_PX + CALIBRATION_MARKER_INNER_PX,
+    ] = marker
+    ok, png = cv2.imencode(".png", canvas)
     if not ok:
         raise HTTPException(status_code=500, detail="png encode failed")
     return Response(content=png.tobytes(), media_type="image/png")

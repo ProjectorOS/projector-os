@@ -44,7 +44,17 @@ interface CalibrationDiagnostic {
   detectedCorners: [number, number][][];
   frameWidth: number;
   frameHeight: number;
+  rejectedCount: number;
   lastSeenAt: number;
+}
+
+interface FrameStats {
+  frameIndex: number;
+  fps: number;
+  lastFrameAgeMs: number;
+  detectorRuns: number;
+  lastDetectedCount: number;
+  receivedAt: number;
 }
 
 interface ViewState {
@@ -68,6 +78,7 @@ interface ViewState {
   cameraOpen: boolean;
   cameraError: string | null;
   switchingCamera: boolean;
+  frameStats: FrameStats | null;
 }
 
 const SERVER_HTTP = defaultServerHttpUrl();
@@ -94,6 +105,7 @@ class ControlApp {
     cameraOpen: false,
     cameraError: null,
     switchingCamera: false,
+    frameStats: null,
   };
   private readonly ws: WsClient;
   private pendingMm = "";
@@ -161,6 +173,7 @@ class ControlApp {
           detectedCorners: ev.detected_corners_cam,
           frameWidth: ev.frame_width,
           frameHeight: ev.frame_height,
+          rejectedCount: ev.rejected_count,
           lastSeenAt: Date.now(),
         };
         break;
@@ -180,6 +193,16 @@ class ControlApp {
         this.state.cameraOpen = ev.camera_open;
         this.state.cameraError = ev.error;
         this.state.switchingCamera = false;
+        break;
+      case "frame_stats":
+        this.state.frameStats = {
+          frameIndex: ev.frame_index,
+          fps: ev.fps,
+          lastFrameAgeMs: ev.last_frame_age_ms,
+          detectorRuns: ev.detector_runs,
+          lastDetectedCount: ev.last_detected_count,
+          receivedAt: Date.now(),
+        };
         break;
       case "detections":
         this.state.detections = ev.objects;
@@ -614,6 +637,12 @@ class ControlApp {
     this.draggingEdge = edge;
     (e.target as Element).setPointerCapture?.(e.pointerId);
 
+    // Live updates to the server are throttled: every move would flood the WS, but we
+    // also want the projector's outline to track the cursor in real time, not just on
+    // release. ~30 Hz is plenty for visual smoothness without overwhelming the bus.
+    let lastSentAt = 0;
+    const SEND_INTERVAL_MS = 33;
+
     const onMove = (ev: PointerEvent): void => {
       const dx = (ev.clientX - startClientX) / scale;
       const dy = (ev.clientY - startClientY) / scale;
@@ -637,12 +666,19 @@ class ControlApp {
       this.applyPreviewLayout(svg, proj, pending);
       this.syncInputsFromPending(pending);
       this.updateWsInfoLive(pending, proj);
+
+      const now = performance.now();
+      if (now - lastSentAt >= SEND_INTERVAL_MS) {
+        this.applyMargins(pending, this.state.showWorkSurfaceOutline);
+        lastSentAt = now;
+      }
     };
 
     const onUp = (): void => {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
       this.draggingEdge = null;
+      // Final commit so the last position (which may have been throttled out) sticks.
       this.applyMargins(this.state.pendingMargins!, this.state.showWorkSurfaceOutline);
     };
 
@@ -708,6 +744,8 @@ class ControlApp {
       const label = current ? `${current.name} (index ${current.index})` : `Camera ${this.state.cameraIndex}`;
       status.appendChild(el("div", "v", label));
       card.appendChild(status);
+
+      card.appendChild(this.renderHeartbeatRow());
 
       const actions = el("div", "row");
       const switchBtn = el("button", "", "Switch camera");
@@ -795,6 +833,36 @@ class ControlApp {
     }
 
     return card;
+  }
+
+  private renderHeartbeatRow(): HTMLElement {
+    const stats = this.state.frameStats;
+    const stale = !stats || Date.now() - stats.receivedAt > 1500;
+    const row = el("div", "heartbeat-row");
+    const dot = el("span", `heartbeat ${stale ? "stale" : "alive"}`);
+    row.appendChild(dot);
+
+    if (!stats) {
+      row.appendChild(el("span", "heartbeat-text muted", "waiting for frames…"));
+      return row;
+    }
+
+    if (stats.lastFrameAgeMs < 0) {
+      row.appendChild(el("span", "heartbeat-text muted", "camera open, no frames yet"));
+      return row;
+    }
+
+    const parts: string[] = [
+      `${stats.fps.toFixed(1)} fps`,
+      `frame #${stats.frameIndex.toLocaleString()}`,
+    ];
+    if (stats.lastFrameAgeMs >= 0) {
+      parts.push(`last frame ${stats.lastFrameAgeMs} ms ago`);
+    }
+    parts.push(`${stats.detectorRuns.toLocaleString()} detector runs`);
+    parts.push(`last saw ${stats.lastDetectedCount} marker${stats.lastDetectedCount === 1 ? "" : "s"}`);
+    row.appendChild(el("span", "heartbeat-text", parts.join(" · ")));
+    return row;
   }
 
   private renderCameraPreview(showMarkerOverlay: boolean): HTMLElement {
@@ -931,13 +999,33 @@ class ControlApp {
     } else if (this.state.capturedMarkers > 0) {
       status.appendChild(el("span", "pill warn", `${this.state.capturedMarkers}/4 markers detected`));
     } else {
-      status.appendChild(el("span", "pill error", "0/4 markers — camera can't see the projection"));
+      status.appendChild(el("span", "pill error", "0/4 markers detected"));
     }
     card.appendChild(status);
 
-    card.appendChild(
-      el("div", "help", "Watch the live preview in the Camera card above — green outlines mark each detected marker."),
-    );
+    // Diagnostic line — what is the detector actually doing?
+    const diag = this.state.calibDiag;
+    if (diag && this.state.capturedMarkers === 0) {
+      const rejected = diag.rejectedCount;
+      let detail: string;
+      if (rejected > 0) {
+        detail =
+          `Detector found ${rejected} candidate quad${rejected === 1 ? "" : "s"} but couldn't decode any. ` +
+          "Likely causes: marker too small in camera frame, blur/glare, or wrong dictionary. " +
+          "Try moving the camera closer to the mat, or reducing projector brightness if the markers look washed out.";
+      } else {
+        detail =
+          "Detector found no candidate quads at all. " +
+          "Likely causes: markers not actually projected (check the projector window), " +
+          "the camera doesn't see the projection (point it at the mat), " +
+          "the work surface is set to an empty rectangle, or the camera image is heavily blurred.";
+      }
+      card.appendChild(el("div", "help warn-text", detail));
+    } else {
+      card.appendChild(
+        el("div", "help", "Watch the live preview in the Camera card above — green outlines mark each detected marker."),
+      );
+    }
 
     // What the projector is actually drawing (so user can confirm markers ARE projected)
     const ids = this.state.calibDiag?.detectedIds ?? [];
