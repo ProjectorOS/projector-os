@@ -9,6 +9,7 @@ dependencies = [
     "opencv-contrib-python>=4.10",
     "numpy>=1.26",
     "pydantic>=2.9",
+    "mediapipe>=0.10",
 ]
 
 [build-system]
