@@ -19,6 +19,13 @@ export interface DetectedObject {
   angle_deg: number;
 }
 
+export interface DetectedHand {
+  handedness: "Left" | "Right";
+  score: number;
+  // 21 MediaPipe Hand landmarks in mat_mm.
+  landmarks_mm: [number, number][];
+}
+
 export interface CalibrationMarker {
   marker_id: number;
   proj_x: number;
@@ -46,6 +53,7 @@ export type ServerEvent =
     }
   | { type: "mode_changed"; mode: Mode }
   | { type: "detections"; objects: DetectedObject[]; ts: number }
+  | { type: "hands"; hands: DetectedHand[]; ts: number }
   | { type: "calibration_updated"; calibration: Calibration }
   | { type: "calibration_prompt"; markers: CalibrationMarker[]; marker_size_px: number }
   | {

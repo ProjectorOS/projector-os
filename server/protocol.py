@@ -24,6 +24,14 @@ class DetectedObject(BaseModel):
     angle_deg: float
 
 
+class DetectedHand(BaseModel):
+    handedness: Literal["Left", "Right"]
+    score: float
+    landmarks_mm: list[list[float]] = Field(
+        description="21 MediaPipe Hand landmarks, each [x_mm, y_mm] in mat coordinates"
+    )
+
+
 class CalibrationMarker(BaseModel):
     marker_id: int
     proj_x: float
@@ -64,6 +72,12 @@ class ModeChangedEvent(BaseModel):
 class DetectionsEvent(BaseModel):
     type: Literal["detections"] = "detections"
     objects: list[DetectedObject]
+    ts: float
+
+
+class HandsEvent(BaseModel):
+    type: Literal["hands"] = "hands"
+    hands: list[DetectedHand]
     ts: float
 
 
@@ -136,6 +150,7 @@ ServerEvent = Union[
     HelloEvent,
     ModeChangedEvent,
     DetectionsEvent,
+    HandsEvent,
     CalibrationUpdatedEvent,
     CalibrationPromptEvent,
     CalibrationCapturedEvent,
