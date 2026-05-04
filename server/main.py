@@ -59,11 +59,37 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 CALIBRATION_PATH = DATA_DIR / "calibration.json"
 WORK_SURFACE_PATH = DATA_DIR / "work_surface.json"
 PREFERENCES_PATH = DATA_DIR / "preferences.json"
-DETECTION_BROADCAST_HZ = 20.0
 # Keep a tracked object on the projection for this long after its marker stops being
 # detected. Smooths over single-frame detection misses (occlusion by a hand, motion
 # blur, glare) so objects don't flicker on/off.
 TRACK_GRACE_PERIOD_S = 0.2
+# Below these thresholds, frame-to-frame pose differences are sensor noise from
+# ArUco subpixel refinement — not real movement. Suppress broadcasts within this
+# band so the WS isn't chattering with sub-mm jitter while objects sit still.
+POSE_POS_EPSILON_MM = 0.5
+POSE_ANGLE_EPSILON_DEG = 0.5
+
+
+def _pose_changed(a: DetectedObject, b: DetectedObject) -> bool:
+    dx = a.center_mm[0] - b.center_mm[0]
+    dy = a.center_mm[1] - b.center_mm[1]
+    if (dx * dx + dy * dy) > POSE_POS_EPSILON_MM * POSE_POS_EPSILON_MM:
+        return True
+    da = abs(a.angle_deg - b.angle_deg) % 360.0
+    if da > 180.0:
+        da = 360.0 - da
+    return da > POSE_ANGLE_EPSILON_DEG
+
+
+def _detections_changed(
+    current: dict[int, DetectedObject], previous: dict[int, DetectedObject]
+) -> bool:
+    if current.keys() != previous.keys():
+        return True
+    for mid, obj in current.items():
+        if _pose_changed(obj, previous[mid]):
+            return True
+    return False
 
 
 class AppState:
@@ -97,6 +123,9 @@ class AppState:
         # period during track mode so a single-frame detection miss doesn't cause the
         # object's overlay to flicker off.
         self._tracked_objects: dict[int, tuple[DetectedObject, float]] = {}
+        # Snapshot of what was last broadcast, for change detection. Reset on mode
+        # change so re-entering track mode always emits an initial broadcast.
+        self._last_broadcast_objects: dict[int, DetectedObject] = {}
 
     async def start(self) -> None:
         # Camera: env var wins for one-off overrides; otherwise restore the saved index.
@@ -230,6 +259,7 @@ class AppState:
             self._calibration_captures.clear()
         if mode != "track":
             self._tracked_objects.clear()
+            self._last_broadcast_objects.clear()
         await self.bus.broadcast(ModeChangedEvent(mode=mode))
 
     async def register_projector(self, proj_w: int, proj_h: int) -> None:
@@ -309,8 +339,6 @@ class AppState:
         await self.set_mode("track")
 
     async def _run_loop(self) -> None:
-        last_track_broadcast = 0.0
-        track_interval = 1.0 / DETECTION_BROADCAST_HZ
         last_calib_broadcast = 0.0
         calib_interval = 1.0 / 6.0
         prev_ts = 0.0
@@ -367,8 +395,11 @@ class AppState:
                         )
                         last_calib_broadcast = ts
                 elif self.mode == "track" and self.calibration is not None:
-                    if ts - last_track_broadcast < track_interval:
-                        continue
+                    # Detect on every frame. Broadcast only when something has actually
+                    # changed (new marker, marker disappeared past grace period, or pose
+                    # moved beyond sensor-noise thresholds) so we don't chatter the WS
+                    # with sub-mm jitter while objects sit still. Grace period applies
+                    # only to deletion — fresh poses overwrite entries on the same frame.
                     objects = self.detector.detect(frame, self.calibration)
                     self._detector_runs += 1
                     self._last_detected_count = len(objects)
@@ -381,9 +412,12 @@ class AppState:
                         for mid, entry in self._tracked_objects.items()
                         if entry[1] >= cutoff
                     }
-                    smoothed = [entry[0] for entry in self._tracked_objects.values()]
-                    await self.bus.broadcast(DetectionsEvent(objects=smoothed, ts=now))
-                    last_track_broadcast = ts
+                    current = {mid: entry[0] for mid, entry in self._tracked_objects.items()}
+                    if _detections_changed(current, self._last_broadcast_objects):
+                        await self.bus.broadcast(
+                            DetectionsEvent(objects=list(current.values()), ts=now)
+                        )
+                        self._last_broadcast_objects = current
         except asyncio.CancelledError:
             raise
         except Exception:
