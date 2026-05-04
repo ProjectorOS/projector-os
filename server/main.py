@@ -30,7 +30,7 @@ from server.calibration import (
 )
 from server.camera import Camera, CameraConfig
 from server.cameras import list_cameras
-from server.detection import ObjectDetector, now_ts
+from server.detection import HandDetector, ObjectDetector, now_ts
 from server.displays import list_displays
 from server.launcher import ProjectorLauncher
 from server.protocol import (
@@ -42,6 +42,7 @@ from server.protocol import (
     DetectedObject,
     DetectionsEvent,
     FrameStatsEvent,
+    HandsEvent,
     HelloEvent,
     Mode,
     ModeChangedEvent,
@@ -62,12 +63,12 @@ PREFERENCES_PATH = DATA_DIR / "preferences.json"
 # Keep a tracked object on the projection for this long after its marker stops being
 # detected. Smooths over single-frame detection misses (occlusion by a hand, motion
 # blur, glare) so objects don't flicker on/off.
-TRACK_GRACE_PERIOD_S = 0.2
+TRACK_GRACE_PERIOD_S = 1
 # Below these thresholds, frame-to-frame pose differences are sensor noise from
 # ArUco subpixel refinement — not real movement. Suppress broadcasts within this
 # band so the WS isn't chattering with sub-mm jitter while objects sit still.
-POSE_POS_EPSILON_MM = 0.5
-POSE_ANGLE_EPSILON_DEG = 0.5
+POSE_POS_EPSILON_MM = 1
+POSE_ANGLE_EPSILON_DEG = 0.1
 
 
 def _pose_changed(a: DetectedObject, b: DetectedObject) -> bool:
@@ -97,6 +98,11 @@ class AppState:
         self.bus = Bus()
         self.camera: Camera | None = None
         self.detector = ObjectDetector()
+        self.hand_detector: HandDetector | None = None
+        try:
+            self.hand_detector = HandDetector()
+        except FileNotFoundError as e:
+            log.warning("hand detection disabled: %s", e)
         self.calibration: Calibration | None = load_calibration(CALIBRATION_PATH)
         self.mode: Mode = "idle"
         self.projector_dims: tuple[int, int] | None = None
@@ -126,6 +132,10 @@ class AppState:
         # Snapshot of what was last broadcast, for change detection. Reset on mode
         # change so re-entering track mode always emits an initial broadcast.
         self._last_broadcast_objects: dict[int, DetectedObject] = {}
+        # Whether the last hands broadcast contained any hands. Lets us emit a single
+        # empty-list broadcast on the present→absent transition (so the UI clears)
+        # without flooding the WS while no hands are visible.
+        self._last_hands_present: bool = False
 
     async def start(self) -> None:
         # Camera: env var wins for one-off overrides; otherwise restore the saved index.
@@ -227,6 +237,8 @@ class AppState:
                 pass
         if self.camera:
             self.camera.close()
+        if self.hand_detector is not None:
+            self.hand_detector.close()
         self.launcher.close()
 
     async def _heartbeat(self) -> None:
@@ -260,6 +272,7 @@ class AppState:
         if mode != "track":
             self._tracked_objects.clear()
             self._last_broadcast_objects.clear()
+            self._last_hands_present = False
         await self.bus.broadcast(ModeChangedEvent(mode=mode))
 
     async def register_projector(self, proj_w: int, proj_h: int) -> None:
@@ -412,12 +425,27 @@ class AppState:
                         for mid, entry in self._tracked_objects.items()
                         if entry[1] >= cutoff
                     }
-                    current = {mid: entry[0] for mid, entry in self._tracked_objects.items()}
+                    current = {
+                        mid: entry[0] for mid, entry in self._tracked_objects.items()
+                    }
                     if _detections_changed(current, self._last_broadcast_objects):
                         await self.bus.broadcast(
                             DetectionsEvent(objects=list(current.values()), ts=now)
                         )
                         self._last_broadcast_objects = current
+
+                    # Hand detection runs every track-mode frame too. Broadcast every
+                    # frame a hand is present (we want low-latency skeleton tracking),
+                    # but emit only a single empty broadcast on the absent transition.
+                    if self.hand_detector is not None:
+                        hands = self.hand_detector.detect(
+                            frame, self.calibration, int(ts * 1000)
+                        )
+                        if hands or self._last_hands_present:
+                            await self.bus.broadcast(
+                                HandsEvent(hands=hands, ts=now)
+                            )
+                            self._last_hands_present = bool(hands)
         except asyncio.CancelledError:
             raise
         except Exception:

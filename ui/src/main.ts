@@ -3,6 +3,7 @@
 // regular browser on the laptop.
 
 import { CalibrationOverlay } from "./calibration";
+import { HandOverlay } from "./hand-overlay";
 import { TrackedObjectOverlay } from "./overlay";
 import { HtmlRenderer } from "./render/html-renderer";
 import { SvgRenderer } from "./render/svg-renderer";
@@ -20,6 +21,7 @@ class ProjectorApp {
   private readonly html: HtmlRenderer;
   private readonly calibrationOverlay: CalibrationOverlay;
   private readonly trackOverlay: TrackedObjectOverlay;
+  private readonly handOverlay: HandOverlay;
   private readonly workSurfaceOverlay: WorkSurfaceOverlay;
   private readonly ws: WsClient;
   private readonly clipRect: SVGRectElement;
@@ -52,6 +54,7 @@ class ProjectorApp {
     this.html = new HtmlRenderer(htmlRoot);
     this.calibrationOverlay = new CalibrationOverlay(this.svg, defaultServerHttpUrl());
     this.trackOverlay = new TrackedObjectOverlay(this.svg);
+    this.handOverlay = new HandOverlay(this.svg);
     this.workSurfaceOverlay = new WorkSurfaceOverlay(this.svg);
 
     this.ws = new WsClient({
@@ -112,6 +115,9 @@ class ProjectorApp {
       case "detections":
         this.trackOverlay.update(ev.objects, this.calibration);
         break;
+      case "hands":
+        this.handOverlay.update(ev.hands, this.calibration);
+        break;
       case "calibration_updated":
         this.calibration = ev.calibration;
         break;
@@ -133,7 +139,10 @@ class ProjectorApp {
 
   private refreshOverlay(): void {
     if (this.mode !== "calibrate") this.calibrationOverlay.hide();
-    if (this.mode !== "track") this.trackOverlay.clear();
+    if (this.mode !== "track") {
+      this.trackOverlay.clear();
+      this.handOverlay.clear();
+    }
     this.workSurfaceOverlay.update(this.workSurface, this.showWorkSurfaceOutline);
   }
 

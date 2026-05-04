@@ -15,6 +15,7 @@ data/work_surface.json
 data/preferences.json
 data/*.png
 data/*.jpg
+data/models/
 
 # macOS
 .DS_Store
