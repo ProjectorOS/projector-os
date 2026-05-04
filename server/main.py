@@ -39,6 +39,7 @@ from server.protocol import (
     CalibrationPromptEvent,
     CalibrationUpdatedEvent,
     CameraChangedEvent,
+    DetectedObject,
     DetectionsEvent,
     FrameStatsEvent,
     HelloEvent,
@@ -57,6 +58,10 @@ CALIBRATION_PATH = DATA_DIR / "calibration.json"
 WORK_SURFACE_PATH = DATA_DIR / "work_surface.json"
 PREFERENCES_PATH = DATA_DIR / "preferences.json"
 DETECTION_BROADCAST_HZ = 20.0
+# Keep a tracked object on the projection for this long after its marker stops being
+# detected. Smooths over single-frame detection misses (occlusion by a hand, motion
+# blur, glare) so objects don't flicker on/off.
+TRACK_GRACE_PERIOD_S = 0.25
 
 
 class AppState:
@@ -84,6 +89,10 @@ class AppState:
         self._fps = 0.0
         self._detector_runs = 0
         self._last_detected_count = 0
+        # marker_id → (last DetectedObject, last_seen_ts). Used to apply the grace
+        # period during track mode so a single-frame detection miss doesn't cause the
+        # object's overlay to flicker off.
+        self._tracked_objects: dict[int, tuple[DetectedObject, float]] = {}
 
     async def start(self) -> None:
         # Camera: env var wins for one-off overrides; otherwise restore the saved index.
@@ -205,6 +214,8 @@ class AppState:
         self.mode = mode
         if mode != "calibrate":
             self._calibration_captures.clear()
+        if mode != "track":
+            self._tracked_objects.clear()
         await self.bus.broadcast(ModeChangedEvent(mode=mode))
 
     async def register_projector(self, proj_w: int, proj_h: int) -> None:
@@ -337,7 +348,16 @@ class AppState:
                     objects = self.detector.detect(frame, self.calibration)
                     self._detector_runs += 1
                     self._last_detected_count = len(objects)
-                    await self.bus.broadcast(DetectionsEvent(objects=objects, ts=now_ts()))
+                    now = now_ts()
+                    for obj in objects:
+                        self._tracked_objects[obj.marker_id] = (obj, now)
+                    cutoff = now - TRACK_GRACE_PERIOD_S
+                    self._tracked_objects = {
+                        mid: entry for mid, entry in self._tracked_objects.items()
+                        if entry[1] >= cutoff
+                    }
+                    smoothed = [entry[0] for entry in self._tracked_objects.values()]
+                    await self.bus.broadcast(DetectionsEvent(objects=smoothed, ts=now))
                     last_track_broadcast = ts
         except asyncio.CancelledError:
             raise
