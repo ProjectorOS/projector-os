@@ -114,13 +114,19 @@
         font-family: ui-monospace, SFMono-Regular, monospace;
         font-size: 12px;
         color: var(--fg);
-        max-height: 220px;
-        overflow-y: auto;
       }
-      .objects .empty { color: var(--muted); font-style: italic; }
-      .objects table { width: 100%; border-collapse: collapse; }
-      .objects td { padding: 4px 8px; border-bottom: 1px solid var(--panel-border); }
+      .objects table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+      .objects td {
+        padding: 6px 8px;
+        border-bottom: 1px solid var(--panel-border);
+        height: 26px;
+        line-height: 1.2;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
       .objects td.id { color: var(--accent); width: 60px; }
+      .objects tr.empty-slot td { color: var(--muted); opacity: 0.4; }
       .displays { display: flex; flex-direction: column; gap: 6px; margin: 10px 0 12px; }
       .display-row {
         display: flex;

@@ -43,7 +43,7 @@ CALIBRATION_MARKER_IDS = [10, 11, 12, 13]  # TL, TR, BR, BL — distinct from ob
 # math need this. The UI receives the total size in CalibrationPromptEvent so it
 # doesn't have to duplicate the constant.
 CALIBRATION_MARKER_INNER_PX = 200
-CALIBRATION_MARKER_QUIET_ZONE_PX = 50
+CALIBRATION_MARKER_QUIET_ZONE_PX = 100
 CALIBRATION_MARKER_TOTAL_PX = CALIBRATION_MARKER_INNER_PX + 2 * CALIBRATION_MARKER_QUIET_ZONE_PX
 
 # Small extra gap between the marker's white edge and the work-surface boundary so the

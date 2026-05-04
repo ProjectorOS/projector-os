@@ -14,8 +14,29 @@ export class CalibrationOverlay {
 
   show(markers: CalibrationMarker[], markerSizePx: number): void {
     this.svg.upsert("calibration", (group: SVGGElement) => {
+      group.setAttribute("clip-path", "url(#work-surface-clip)");
       const half = markerSizePx / 2;
+      // Amber outline drawn just outside the white quiet zone, on the projector's
+      // black background. Doesn't interfere with the detector (which only looks at the
+      // contrast at the marker's own black border, deep inside the white quiet zone)
+      // and gives the user a clearly-visible "marker zone" outline on the mat.
+      const borderOffset = 8;
+      const borderSize = markerSizePx + 2 * borderOffset;
       for (const m of markers) {
+        const border = SvgRenderer.rect(
+          m.proj_x - half - borderOffset,
+          m.proj_y - half - borderOffset,
+          borderSize,
+          borderSize,
+          {
+            fill: "none",
+            stroke: "#fbbf24",
+            "stroke-width": "3",
+            "stroke-dasharray": "8 6",
+          },
+        );
+        group.appendChild(border);
+
         const img = SvgRenderer.image(
           m.proj_x - half,
           m.proj_y - half,

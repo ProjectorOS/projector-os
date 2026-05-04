@@ -22,6 +22,7 @@ class ProjectorApp {
   private readonly trackOverlay: TrackedObjectOverlay;
   private readonly workSurfaceOverlay: WorkSurfaceOverlay;
   private readonly ws: WsClient;
+  private readonly clipRect: SVGRectElement;
 
   constructor() {
     const svgRoot = document.getElementById("svg-layer") as unknown as SVGSVGElement;
@@ -30,7 +31,22 @@ class ProjectorApp {
     window.addEventListener("resize", () => {
       this.setSvgViewBox(svgRoot);
       this.registerDimensions();
+      this.updateClipRect();
     });
+
+    // SVG clipPath that confines all overlay drawing (calibration markers, tracked
+    // objects, etc.) to inside the work-surface rectangle. Updated whenever work_surface
+    // changes; default covers the full window so nothing is clipped before we know the
+    // work surface.
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    const defs = document.createElementNS(SVG_NS, "defs");
+    const clipPath = document.createElementNS(SVG_NS, "clipPath");
+    clipPath.setAttribute("id", "work-surface-clip");
+    this.clipRect = document.createElementNS(SVG_NS, "rect");
+    clipPath.appendChild(this.clipRect);
+    defs.appendChild(clipPath);
+    svgRoot.insertBefore(defs, svgRoot.firstChild);
+    this.updateClipRect();
 
     this.svg = new SvgRenderer(svgRoot);
     this.html = new HtmlRenderer(htmlRoot);
@@ -43,6 +59,23 @@ class ProjectorApp {
       onEvent: (e) => this.onEvent(e),
       onState: (s) => this.renderStatus(s),
     });
+  }
+
+  private updateClipRect(): void {
+    const ws = this.workSurface;
+    if (ws) {
+      this.clipRect.setAttribute("x", String(ws.x));
+      this.clipRect.setAttribute("y", String(ws.y));
+      this.clipRect.setAttribute("width", String(ws.width));
+      this.clipRect.setAttribute("height", String(ws.height));
+    } else {
+      // No work surface known yet — let everything render so the projector view isn't
+      // blank during initial load.
+      this.clipRect.setAttribute("x", "0");
+      this.clipRect.setAttribute("y", "0");
+      this.clipRect.setAttribute("width", String(window.innerWidth));
+      this.clipRect.setAttribute("height", String(window.innerHeight));
+    }
   }
 
   start(): void {
@@ -68,6 +101,7 @@ class ProjectorApp {
         this.calibration = ev.calibration;
         this.workSurface = ev.work_surface;
         this.showWorkSurfaceOutline = ev.show_work_surface_outline;
+        this.updateClipRect();
         this.refreshOverlay();
         this.registerDimensions();
         break;
@@ -87,6 +121,7 @@ class ProjectorApp {
       case "work_surface_updated":
         this.workSurface = ev.work_surface;
         this.showWorkSurfaceOutline = ev.show_outline;
+        this.updateClipRect();
         this.refreshOverlay();
         break;
       case "calibration_captured":

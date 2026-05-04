@@ -147,6 +147,40 @@ class ControlApp {
   }
 
   private onEvent(ev: ServerEvent): void {
+    // High-frequency events update only the small parts of the DOM they need to,
+    // bypassing the full render(). Otherwise buttons get destroyed and re-created
+    // many times per second and clicks fail mid-press.
+    switch (ev.type) {
+      case "frame_stats":
+        this.state.frameStats = {
+          frameIndex: ev.frame_index,
+          fps: ev.fps,
+          lastFrameAgeMs: ev.last_frame_age_ms,
+          detectorRuns: ev.detector_runs,
+          lastDetectedCount: ev.last_detected_count,
+          receivedAt: Date.now(),
+        };
+        this.updateHeartbeatLive();
+        return;
+      case "calibration_captured":
+        this.state.capturedMarkers = ev.detected_marker_ids.length;
+        this.state.calibDiag = {
+          detectedIds: ev.detected_marker_ids,
+          detectedCorners: ev.detected_corners_cam,
+          frameWidth: ev.frame_width,
+          frameHeight: ev.frame_height,
+          rejectedCount: ev.rejected_count,
+          lastSeenAt: Date.now(),
+        };
+        this.updateCalibStatusLive();
+        this.updateMarkerOverlayLive();
+        return;
+      case "detections":
+        this.state.detections = ev.objects;
+        this.state.lastDetectionTs = ev.ts;
+        this.updateDetectionsTableLive();
+        return;
+    }
     switch (ev.type) {
       case "hello":
         this.state.mode = ev.mode;
@@ -176,17 +210,6 @@ class ControlApp {
         this.state.capturedMarkers = 0;
         this.state.calibDiag = null;
         break;
-      case "calibration_captured":
-        this.state.capturedMarkers = ev.detected_marker_ids.length;
-        this.state.calibDiag = {
-          detectedIds: ev.detected_marker_ids,
-          detectedCorners: ev.detected_corners_cam,
-          frameWidth: ev.frame_width,
-          frameHeight: ev.frame_height,
-          rejectedCount: ev.rejected_count,
-          lastSeenAt: Date.now(),
-        };
-        break;
       case "projector_registered":
         this.state.projector = [ev.proj_width, ev.proj_height];
         this.state.switchingDisplay = false;
@@ -203,20 +226,6 @@ class ControlApp {
         this.state.cameraOpen = ev.camera_open;
         this.state.cameraError = ev.error;
         this.state.switchingCamera = false;
-        break;
-      case "frame_stats":
-        this.state.frameStats = {
-          frameIndex: ev.frame_index,
-          fps: ev.fps,
-          lastFrameAgeMs: ev.last_frame_age_ms,
-          detectorRuns: ev.detector_runs,
-          lastDetectedCount: ev.last_detected_count,
-          receivedAt: Date.now(),
-        };
-        break;
-      case "detections":
-        this.state.detections = ev.objects;
-        this.state.lastDetectionTs = ev.ts;
         break;
     }
     this.render();
@@ -889,37 +898,130 @@ class ControlApp {
   }
 
   private renderHeartbeatRow(): HTMLElement {
+    const row = el("div", "heartbeat-row");
+    row.dataset.role = "heartbeat-row";
+    this.populateHeartbeatRow(row);
+    return row;
+  }
+
+  private populateHeartbeatRow(row: HTMLElement): void {
+    row.innerHTML = "";
     const stats = this.state.frameStats;
     const stale = !stats || Date.now() - stats.receivedAt > 1500;
-    const row = el("div", "heartbeat-row");
-    const dot = el("span", `heartbeat ${stale ? "stale" : "alive"}`);
-    row.appendChild(dot);
-
+    row.appendChild(el("span", `heartbeat ${stale ? "stale" : "alive"}`));
     if (!stats) {
       row.appendChild(el("span", "heartbeat-text muted", "waiting for frames…"));
-      return row;
+      return;
     }
-
     if (stats.lastFrameAgeMs < 0) {
       row.appendChild(el("span", "heartbeat-text muted", "camera open, no frames yet"));
-      return row;
+      return;
     }
-
     const parts: string[] = [
       `${stats.fps.toFixed(1)} fps`,
       `frame #${stats.frameIndex.toLocaleString()}`,
+      `last frame ${stats.lastFrameAgeMs} ms ago`,
+      `${stats.detectorRuns.toLocaleString()} detector runs`,
+      `last saw ${stats.lastDetectedCount} marker${stats.lastDetectedCount === 1 ? "" : "s"}`,
     ];
-    if (stats.lastFrameAgeMs >= 0) {
-      parts.push(`last frame ${stats.lastFrameAgeMs} ms ago`);
-    }
-    parts.push(`${stats.detectorRuns.toLocaleString()} detector runs`);
-    parts.push(`last saw ${stats.lastDetectedCount} marker${stats.lastDetectedCount === 1 ? "" : "s"}`);
     row.appendChild(el("span", "heartbeat-text", parts.join(" · ")));
-    return row;
+  }
+
+  private updateHeartbeatLive(): void {
+    const row = this.root.querySelector('[data-role="heartbeat-row"]') as HTMLElement | null;
+    if (row) this.populateHeartbeatRow(row);
+  }
+
+  private populateCalibStatus(node: HTMLElement): void {
+    node.innerHTML = "";
+    if (this.state.capturedMarkers === 4) {
+      node.appendChild(el("span", "pill ok", "All 4 markers detected"));
+    } else if (this.state.capturedMarkers > 0) {
+      node.appendChild(el("span", "pill warn", `${this.state.capturedMarkers}/4 markers detected`));
+    } else {
+      node.appendChild(el("span", "pill error", "0/4 markers detected"));
+    }
+  }
+
+  private updateCalibStatusLive(): void {
+    const status = this.root.querySelector('[data-role="calib-status"]') as HTMLElement | null;
+    if (status) this.populateCalibStatus(status);
+    // Save button enable state changes with marker count.
+    const save = this.root.querySelector('[data-role="calib-save"]') as HTMLButtonElement | null;
+    if (save) save.disabled = this.state.capturedMarkers < 4;
+    // Diagnostic hint text changes as detection state changes.
+    const hint = this.root.querySelector('[data-role="calib-diag-hint"]') as HTMLElement | null;
+    if (hint) this.populateCalibDiagHint(hint);
+  }
+
+  private populateCalibDiagHint(node: HTMLElement): void {
+    node.innerHTML = "";
+    const diag = this.state.calibDiag;
+    if (diag && this.state.capturedMarkers === 0) {
+      const rejected = diag.rejectedCount;
+      node.className = "help warn-text";
+      node.textContent =
+        rejected > 0
+          ? `Detector found ${rejected} candidate quad${rejected === 1 ? "" : "s"} but couldn't decode any. Likely causes: marker too small in camera frame, blur/glare, or wrong dictionary.`
+          : "Detector found no candidate quads at all. Likely causes: markers not actually projected (check the projector window), the camera doesn't see the projection (point it at the mat), the work surface is set to an empty rectangle, or the camera image is heavily blurred.";
+    } else {
+      node.className = "help";
+      node.textContent =
+        "Watch the live preview in the Camera card above — green outlines mark each detected marker.";
+    }
+  }
+
+  private updateMarkerOverlayLive(): void {
+    const wrap = this.root.querySelector('[data-role="cam-preview"]') as HTMLElement | null;
+    if (!wrap) return;
+    if (this.state.mode !== "calibrate") return;
+    const old = wrap.querySelector('[data-role="marker-overlay"]');
+    old?.remove();
+    const diag = this.state.calibDiag;
+    if (diag && diag.frameWidth > 0 && diag.frameHeight > 0) {
+      const overlay = this.buildMarkerOverlay(diag);
+      overlay.dataset.role = "marker-overlay";
+      wrap.appendChild(overlay);
+    }
+  }
+
+  private updateDetectionsTableLive(): void {
+    const tbody = this.root.querySelector('[data-role="detections-tbody"]') as HTMLTableSectionElement | null;
+    if (!tbody) return;
+    this.populateDetectionsTable(tbody);
+  }
+
+  private populateDetectionsTable(tbody: HTMLTableSectionElement): void {
+    // One row per ArUco object-marker ID (server allocates 0..9 for objects). Each
+    // row's slot is fixed: marker #0 always lives on row 0, #1 on row 1, etc., so the
+    // card never reflows as markers come and go. Undetected slots show "—".
+    const SLOTS = 10;
+    const byId = new Map<number, DetectedObject>();
+    for (const obj of this.state.detections) {
+      byId.set(obj.marker_id, obj);
+    }
+    tbody.innerHTML = "";
+    for (let id = 0; id < SLOTS; id++) {
+      const tr = el("tr");
+      const obj = byId.get(id);
+      tr.appendChild(el("td", "id", `#${id}`));
+      if (obj) {
+        tr.appendChild(
+          el("td", "", `(${obj.center_mm[0].toFixed(1)}, ${obj.center_mm[1].toFixed(1)}) mm`),
+        );
+        tr.appendChild(el("td", "", `${obj.angle_deg.toFixed(1)}°`));
+      } else {
+        tr.classList.add("empty-slot");
+        tr.appendChild(el("td", "", "—"));
+        tr.appendChild(el("td", "", "—"));
+      }
+      tbody.appendChild(tr);
+    }
   }
 
   private renderCameraPreview(showMarkerOverlay: boolean): HTMLElement {
     const wrap = el("div", "calib-preview");
+    wrap.dataset.role = "cam-preview";
     if (this.previewRotation === 180) wrap.classList.add("rot-180");
 
     if (!this.cameraPreviewImg) {
@@ -934,7 +1036,9 @@ class ControlApp {
     if (showMarkerOverlay) {
       const diag = this.state.calibDiag;
       if (diag && diag.frameWidth > 0 && diag.frameHeight > 0) {
-        wrap.appendChild(this.buildMarkerOverlay(diag));
+        const overlay = this.buildMarkerOverlay(diag);
+        overlay.dataset.role = "marker-overlay";
+        wrap.appendChild(overlay);
       }
     }
     return wrap;
@@ -1045,69 +1149,26 @@ class ControlApp {
       return card;
     }
 
-    // Status pill
+    // Status pill — updated in place by `updateCalibStatusLive` on every
+    // `calibration_captured` so the rest of the card (including buttons + input) stays
+    // mounted across the ~6 Hz event stream.
     const status = el("div", "row");
-    if (this.state.capturedMarkers === 4) {
-      status.appendChild(el("span", "pill ok", "All 4 markers detected"));
-    } else if (this.state.capturedMarkers > 0) {
-      status.appendChild(el("span", "pill warn", `${this.state.capturedMarkers}/4 markers detected`));
-    } else {
-      status.appendChild(el("span", "pill error", "0/4 markers detected"));
-    }
+    status.dataset.role = "calib-status";
+    this.populateCalibStatus(status);
     card.appendChild(status);
 
-    // Diagnostic line — what is the detector actually doing?
-    const diag = this.state.calibDiag;
-    if (diag && this.state.capturedMarkers === 0) {
-      const rejected = diag.rejectedCount;
-      let detail: string;
-      if (rejected > 0) {
-        detail =
-          `Detector found ${rejected} candidate quad${rejected === 1 ? "" : "s"} but couldn't decode any. ` +
-          "Likely causes: marker too small in camera frame, blur/glare, or wrong dictionary. " +
-          "Try moving the camera closer to the mat, or reducing projector brightness if the markers look washed out.";
-      } else {
-        detail =
-          "Detector found no candidate quads at all. " +
-          "Likely causes: markers not actually projected (check the projector window), " +
-          "the camera doesn't see the projection (point it at the mat), " +
-          "the work surface is set to an empty rectangle, or the camera image is heavily blurred.";
-      }
-      card.appendChild(el("div", "help warn-text", detail));
-    } else {
-      card.appendChild(
-        el("div", "help", "Watch the live preview in the Camera card above — green outlines mark each detected marker."),
-      );
-    }
-
-    // What the projector is actually drawing (so user can confirm markers ARE projected)
-    const ids = this.state.calibDiag?.detectedIds ?? [];
-    const expected = [10, 11, 12, 13];
-    const missing = expected.filter((id) => !ids.includes(id));
-    if (missing.length > 0) {
-      card.appendChild(
-        el(
-          "div",
-          "help",
-          `Expected marker IDs 10–13. Currently missing: ${missing.join(", ")}. ` +
-            "If the camera doesn't see them, check that the projector is showing 4 black-and-white squares, the camera is pointed at the mat, " +
-            "and the work-surface outline matches the mat edges.",
-        ),
-      );
-    } else {
-      card.appendChild(
-        el(
-          "div",
-          "help",
-          "All 4 markers visible. On the mat, lay a ruler along the amber line projected below the top markers (between the two amber tick marks), measure its length in millimeters, type it in, and click Save.",
-        ),
-      );
-    }
+    // Diagnostic line — what is the detector actually doing? Updated in place by
+    // `updateCalibStatusLive` so the input + buttons below stay mounted.
+    const diagHint = el("div", "help");
+    diagHint.dataset.role = "calib-diag-hint";
+    this.populateCalibDiagHint(diagHint);
+    card.appendChild(diagHint);
 
     const inputRow = el("div", "row");
     inputRow.appendChild(this.getMeasurementInput());
 
     const saveBtn = el("button", "primary", "Save");
+    saveBtn.dataset.role = "calib-save";
     saveBtn.disabled = this.state.capturedMarkers < 4;
     saveBtn.addEventListener("click", () => this.commitMeasurement());
     inputRow.appendChild(saveBtn);
@@ -1185,29 +1246,14 @@ class ControlApp {
   private renderTrackCard(): HTMLElement {
     const card = el("div", "card");
     card.appendChild(el("h2", "", "Tracked objects"));
-    const objects = el("div", "objects");
-
-    if (this.state.detections.length === 0) {
-      objects.appendChild(el("div", "empty", "No objects detected. Place an ArUco-tagged item on the mat."));
-    } else {
-      const table = el("table");
-      for (const obj of this.state.detections) {
-        const tr = el("tr");
-        const id = el("td", "id", `#${obj.marker_id}`);
-        const center = el(
-          "td",
-          "",
-          `(${obj.center_mm[0].toFixed(1)}, ${obj.center_mm[1].toFixed(1)}) mm`,
-        );
-        const angle = el("td", "", `${obj.angle_deg.toFixed(1)}°`);
-        tr.appendChild(id);
-        tr.appendChild(center);
-        tr.appendChild(angle);
-        table.appendChild(tr);
-      }
-      objects.appendChild(table);
-    }
-    card.appendChild(objects);
+    const wrap = el("div", "objects");
+    const table = el("table");
+    const tbody = el("tbody");
+    tbody.dataset.role = "detections-tbody";
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+    this.populateDetectionsTable(tbody);
+    card.appendChild(wrap);
     return card;
   }
 
