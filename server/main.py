@@ -50,7 +50,9 @@ from server.protocol import (
     WorkSurfaceUpdatedEvent,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
 log = logging.getLogger("server.main")
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -61,7 +63,7 @@ DETECTION_BROADCAST_HZ = 20.0
 # Keep a tracked object on the projection for this long after its marker stops being
 # detected. Smooths over single-frame detection misses (occlusion by a hand, motion
 # blur, glare) so objects don't flicker on/off.
-TRACK_GRACE_PERIOD_S = 0.25
+TRACK_GRACE_PERIOD_S = 0.2
 
 
 class AppState:
@@ -76,7 +78,9 @@ class AppState:
         self.camera_index: int | None = None
         self.launcher = ProjectorLauncher()
         self.preferences = prefs_persist.load(PREFERENCES_PATH)
-        self.show_work_surface_outline: bool = self.preferences.show_work_surface_outline
+        self.show_work_surface_outline: bool = (
+            self.preferences.show_work_surface_outline
+        )
         self._calibration_layout: list = []
         self._calibration_proj_w: int = 0
         self._calibration_proj_h: int = 0
@@ -113,14 +117,22 @@ class AppState:
         # Projector: re-launch the kiosk on the previously chosen display, after a short
         # delay so the Vite dev server is reachable.
         if self.preferences.projector_display is not None:
-            asyncio.create_task(self._auto_launch_projector(), name="auto-launch-projector")
+            asyncio.create_task(
+                self._auto_launch_projector(), name="auto-launch-projector"
+            )
 
     async def _auto_launch_projector(self) -> None:
         await asyncio.sleep(2.0)
         d = self.preferences.projector_display
         if d is None or self.launcher.is_running():
             return
-        log.info("restoring projector kiosk on saved display (%d, %d) %dx%d", d.x, d.y, d.width, d.height)
+        log.info(
+            "restoring projector kiosk on saved display (%d, %d) %dx%d",
+            d.x,
+            d.y,
+            d.width,
+            d.height,
+        )
         try:
             self.launch_projector(d.x, d.y, d.width, d.height)
         except RuntimeError as e:
@@ -159,7 +171,9 @@ class AppState:
             self.camera_index = None
             self.preferences.camera_index = None
             prefs_persist.save(self.preferences, PREFERENCES_PATH)
-            await self.bus.broadcast(CameraChangedEvent(camera_index=None, camera_open=False))
+            await self.bus.broadcast(
+                CameraChangedEvent(camera_index=None, camera_open=False)
+            )
             return
         err = await self._open_camera(index)
         # Save whatever the user chose, even if it failed to open — they can retry next time.
@@ -226,10 +240,14 @@ class AppState:
             self.work_surface = ws_persist.default_for(proj_w, proj_h)
         else:
             self.work_surface = ws_persist.clamp(self.work_surface, proj_w, proj_h)
-        await self.bus.broadcast(ProjectorRegisteredEvent(proj_width=proj_w, proj_height=proj_h))
+        await self.bus.broadcast(
+            ProjectorRegisteredEvent(proj_width=proj_w, proj_height=proj_h)
+        )
         await self._broadcast_work_surface()
 
-    async def set_work_surface(self, x: int, y: int, w: int, h: int, show_outline: bool | None) -> None:
+    async def set_work_surface(
+        self, x: int, y: int, w: int, h: int, show_outline: bool | None
+    ) -> None:
         if self.projector_dims is None:
             log.warning("set_work_surface called before projector registered")
             return
@@ -317,7 +335,11 @@ class AppState:
                     dt = ts - prev_ts
                     if dt > 0:
                         inst_fps = 1.0 / dt
-                        self._fps = self._fps * 0.9 + inst_fps * 0.1 if self._fps > 0 else inst_fps
+                        self._fps = (
+                            self._fps * 0.9 + inst_fps * 0.1
+                            if self._fps > 0
+                            else inst_fps
+                        )
                 prev_ts = ts
 
                 if self.mode == "calibrate":
@@ -331,7 +353,9 @@ class AppState:
                     if ts - last_calib_broadcast >= calib_interval:
                         h, w = frame.shape[:2]
                         ids = sorted(capture.cam_corners_by_id.keys())
-                        corners = [capture.cam_corners_by_id[mid].tolist() for mid in ids]
+                        corners = [
+                            capture.cam_corners_by_id[mid].tolist() for mid in ids
+                        ]
                         await self.bus.broadcast(
                             CalibrationCapturedEvent(
                                 detected_marker_ids=ids,
@@ -353,7 +377,8 @@ class AppState:
                         self._tracked_objects[obj.marker_id] = (obj, now)
                     cutoff = now - TRACK_GRACE_PERIOD_S
                     self._tracked_objects = {
-                        mid: entry for mid, entry in self._tracked_objects.items()
+                        mid: entry
+                        for mid, entry in self._tracked_objects.items()
                         if entry[1] >= cutoff
                     }
                     smoothed = [entry[0] for entry in self._tracked_objects.values()]
@@ -476,11 +501,17 @@ async def marker_png(marker_id: int) -> Response:
     if not 0 <= marker_id < 50:
         raise HTTPException(status_code=404, detail="marker out of range")
     aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-    marker = cv2.aruco.generateImageMarker(aruco_dict, marker_id, CALIBRATION_MARKER_INNER_PX)
-    canvas = np.full((CALIBRATION_MARKER_TOTAL_PX, CALIBRATION_MARKER_TOTAL_PX), 255, dtype=np.uint8)
+    marker = cv2.aruco.generateImageMarker(
+        aruco_dict, marker_id, CALIBRATION_MARKER_INNER_PX
+    )
+    canvas = np.full(
+        (CALIBRATION_MARKER_TOTAL_PX, CALIBRATION_MARKER_TOTAL_PX), 255, dtype=np.uint8
+    )
     canvas[
-        CALIBRATION_MARKER_QUIET_ZONE_PX : CALIBRATION_MARKER_QUIET_ZONE_PX + CALIBRATION_MARKER_INNER_PX,
-        CALIBRATION_MARKER_QUIET_ZONE_PX : CALIBRATION_MARKER_QUIET_ZONE_PX + CALIBRATION_MARKER_INNER_PX,
+        CALIBRATION_MARKER_QUIET_ZONE_PX : CALIBRATION_MARKER_QUIET_ZONE_PX
+        + CALIBRATION_MARKER_INNER_PX,
+        CALIBRATION_MARKER_QUIET_ZONE_PX : CALIBRATION_MARKER_QUIET_ZONE_PX
+        + CALIBRATION_MARKER_INNER_PX,
     ] = marker
     ok, png = cv2.imencode(".png", canvas)
     if not ok:
@@ -520,7 +551,9 @@ async def ws_endpoint(ws: WebSocket) -> None:
             if mtype == "set_mode":
                 await state.set_mode(msg["mode"])
             elif mtype == "register_projector":
-                await state.register_projector(int(msg["proj_width"]), int(msg["proj_height"]))
+                await state.register_projector(
+                    int(msg["proj_width"]), int(msg["proj_height"])
+                )
             elif mtype == "start_calibration":
                 await state.start_calibration()
             elif mtype == "finish_calibration":
