@@ -115,6 +115,11 @@ class ControlApp {
   // Persistent <img> for the camera MJPEG preview. Re-used across renders so we don't
   // tear down and reopen the long-lived multipart HTTP connection on every event.
   private cameraPreviewImg: HTMLImageElement | null = null;
+  // Persistent <input> for the measurement field. The calibration card re-renders ~6
+  // times per second on calibration_captured events; rebuilding the input would steal
+  // focus mid-keystroke and you couldn't type. Reusing the same element keeps focus
+  // and the typed value alive across renders.
+  private measurementInput: HTMLInputElement | null = null;
   // UI prefs persisted to localStorage (per browser).
   private workSurfaceCollapsed = readBool("workSurfaceCollapsed", false);
   private previewRotation: 0 | 180 = readNumber("previewRotation", 0) === 180 ? 180 : 0;
@@ -279,6 +284,13 @@ class ControlApp {
 
   private render(): void {
     if (this.draggingEdge) return;
+
+    // The `innerHTML = ""` below detaches every input from the DOM, which loses focus
+    // and caret position even for elements we keep across renders (the measurement
+    // input). Capture focus before, restore after, so typing isn't interrupted by the
+    // ~6 Hz calibration_captured / 1 Hz frame_stats event stream.
+    const focusSnapshot = this.captureFocus();
+
     this.root.innerHTML = "";
     this.root.appendChild(this.renderStatusCard());
     this.root.appendChild(this.renderDisplayCard());
@@ -292,6 +304,42 @@ class ControlApp {
     }
     if (this.state.mode === "track") {
       this.root.appendChild(this.renderTrackCard());
+    }
+
+    this.restoreFocus(focusSnapshot);
+  }
+
+  private captureFocus(): { selector: string; selStart: number | null; selEnd: number | null } | null {
+    const ae = document.activeElement;
+    if (!(ae instanceof HTMLInputElement) && !(ae instanceof HTMLTextAreaElement)) return null;
+    let selector: string | null = null;
+    if (ae === this.measurementInput) {
+      selector = 'input[data-role="measurement-input"]';
+    } else if (ae instanceof HTMLInputElement && ae.dataset.field) {
+      selector = `input[data-field="${ae.dataset.field}"]`;
+    }
+    if (!selector) return null;
+    return {
+      selector,
+      selStart: ae.selectionStart,
+      selEnd: ae.selectionEnd,
+    };
+  }
+
+  private restoreFocus(snap: ReturnType<typeof this.captureFocus>): void {
+    if (!snap) return;
+    const target = this.root.querySelector(snap.selector) as
+      | HTMLInputElement
+      | HTMLTextAreaElement
+      | null;
+    if (!target) return;
+    target.focus();
+    if (snap.selStart !== null && snap.selEnd !== null) {
+      try {
+        target.setSelectionRange(snap.selStart, snap.selEnd);
+      } catch {
+        // setSelectionRange isn't supported on every input type (e.g. number); ignore.
+      }
     }
   }
 
@@ -1046,37 +1094,83 @@ class ControlApp {
         el(
           "div",
           "help",
-          "All 4 markers visible. Measure the on-mat distance between the centers of the top-left (id 10) and top-right (id 11) markers, type it in millimeters, and click Save.",
+          "All 4 markers visible. On the mat, lay a ruler along the amber line projected below the top markers (between the two amber tick marks), measure its length in millimeters, type it in, and click Save.",
         ),
       );
     }
 
     const inputRow = el("div", "row");
-    const input = el("input") as HTMLInputElement;
-    input.type = "number";
-    input.step = "0.1";
-    input.placeholder = "horizontal mm";
-    input.value = this.pendingMm;
-    input.addEventListener("input", () => {
-      this.pendingMm = input.value;
-    });
-    inputRow.appendChild(input);
+    inputRow.appendChild(this.getMeasurementInput());
 
     const saveBtn = el("button", "primary", "Save");
     saveBtn.disabled = this.state.capturedMarkers < 4;
-    saveBtn.addEventListener("click", () => {
-      const v = parseFloat(this.pendingMm);
-      if (Number.isFinite(v) && v > 0) {
-        this.ws.send({ type: "finish_calibration", horizontal_mm: v });
-        this.pendingMm = "";
-      }
-    });
+    saveBtn.addEventListener("click", () => this.commitMeasurement());
     inputRow.appendChild(saveBtn);
     card.appendChild(inputRow);
+
+    const hint = el("div", "measurement-hint");
+    hint.dataset.role = "measurement-hint";
+    card.appendChild(hint);
+    // Refresh the hint after the element is in the DOM so the conversion text is up to date.
+    queueMicrotask(() => this.refreshMeasurementHint());
 
     return card;
   }
 
+
+  private getMeasurementInput(): HTMLInputElement {
+    if (!this.measurementInput) {
+      const input = document.createElement("input");
+      input.type = "text";
+      input.inputMode = "decimal";
+      input.placeholder = 'e.g. 305 or 12 in';
+      input.value = this.pendingMm;
+      input.autocomplete = "off";
+      input.dataset.role = "measurement-input";
+      input.addEventListener("input", () => {
+        this.pendingMm = input.value;
+        this.refreshMeasurementHint();
+      });
+      input.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") this.commitMeasurement();
+      });
+      this.measurementInput = input;
+    }
+    return this.measurementInput;
+  }
+
+  private commitMeasurement(): void {
+    const mm = parseLengthMm(this.pendingMm);
+    if (mm === null || mm <= 0) return;
+    if (this.state.capturedMarkers !== 4) return;
+    this.ws.send({ type: "finish_calibration", horizontal_mm: mm });
+    this.pendingMm = "";
+    if (this.measurementInput) this.measurementInput.value = "";
+    this.refreshMeasurementHint();
+  }
+
+  private refreshMeasurementHint(): void {
+    const hint = this.root.querySelector('[data-role="measurement-hint"]') as HTMLElement | null;
+    if (!hint) return;
+    if (!this.pendingMm.trim()) {
+      hint.textContent = "";
+      hint.className = "measurement-hint";
+      return;
+    }
+    const mm = parseLengthMm(this.pendingMm);
+    if (mm === null) {
+      hint.textContent = "couldn't parse — try '305' or '12 in'";
+      hint.className = "measurement-hint warn";
+    } else if (mm <= 0) {
+      hint.textContent = "must be positive";
+      hint.className = "measurement-hint warn";
+    } else {
+      // Show conversion only when the user typed a non-mm unit so it's useful, not noise.
+      const looksLikeMm = /^[\d.\s]+(mm)?$/i.test(this.pendingMm.trim());
+      hint.textContent = looksLikeMm ? `${mm.toFixed(1)} mm` : `→ ${mm.toFixed(1)} mm`;
+      hint.className = "measurement-hint";
+    }
+  }
 
   private renderTrackCard(): HTMLElement {
     const card = el("div", "card");
@@ -1136,6 +1230,50 @@ function parsePending(p: PendingMargins): { left: number; top: number; right: nu
 
 function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
+}
+
+/**
+ * Parse a length expression into millimeters. Accepts:
+ *   "305", "305 mm", "30.5 cm", "12 in", "12 inch", "12 inches", "12\""
+ * Returns null if it can't parse.
+ */
+function parseLengthMm(input: string): number | null {
+  const m = input
+    .trim()
+    .toLowerCase()
+    .match(/^(-?\d+(?:\.\d+)?|-?\.\d+)\s*(.*)$/);
+  if (!m) return null;
+  const value = parseFloat(m[1]);
+  if (!Number.isFinite(value)) return null;
+  const unit = m[2].trim().replace(/\.$/, "");
+  switch (unit) {
+    case "":
+    case "mm":
+    case "millimeter":
+    case "millimeters":
+      return value;
+    case "cm":
+    case "centimeter":
+    case "centimeters":
+      return value * 10;
+    case "m":
+    case "meter":
+    case "meters":
+      return value * 1000;
+    case "in":
+    case "ins":
+    case "inch":
+    case "inches":
+    case '"':
+      return value * 25.4;
+    case "ft":
+    case "foot":
+    case "feet":
+    case "'":
+      return value * 304.8;
+    default:
+      return null;
+  }
 }
 
 function readBool(key: string, fallback: boolean): boolean {

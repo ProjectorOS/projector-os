@@ -77,4 +77,14 @@ export class SvgRenderer implements Renderer {
     el.setAttribute("href", href);
     return el;
   }
+
+  static line(x1: number, y1: number, x2: number, y2: number, attrs: Record<string, string> = {}): SVGLineElement {
+    const el = document.createElementNS(SVG_NS, "line");
+    el.setAttribute("x1", String(x1));
+    el.setAttribute("y1", String(y1));
+    el.setAttribute("x2", String(x2));
+    el.setAttribute("y2", String(y2));
+    for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+    return el;
+  }
 }

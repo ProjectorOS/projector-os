@@ -41,7 +41,82 @@ export class CalibrationOverlay {
         );
         group.appendChild(label);
       }
+
+      this.drawMeasurementGuide(group, markers, markerSizePx);
     });
+  }
+
+  /**
+   * Project a "measure this" guide between the TL (id 10) and TR (id 11) markers so the
+   * user has a tangible line to lay a ruler against — no need to eyeball where each
+   * marker's center is. The guide is positioned below the markers (toward the inside of
+   * the work surface) with vertical leader lines dropping from the marker centers down
+   * to a horizontal measurement line. The horizontal line's endpoints are aligned with
+   * the marker centers, so measuring along it gives the same number as center-to-center.
+   */
+  private drawMeasurementGuide(group: SVGGElement, markers: CalibrationMarker[], markerSizePx: number): void {
+    const tl = markers.find((m) => m.marker_id === 10);
+    const tr = markers.find((m) => m.marker_id === 11);
+    if (!tl || !tr) return;
+    if (Math.abs(tl.proj_y - tr.proj_y) > 1) return; // expect same Y
+
+    const half = markerSizePx / 2;
+    const x1 = tl.proj_x;
+    const x2 = tr.proj_x;
+    const markerBottomY = tl.proj_y + half;
+    const measureY = markerBottomY + 60; // sit below "id 10" / "id 11" labels
+    const color = "#fbbf24"; // amber — visually distinct from white labels and green overlays
+    const stroke = "3";
+
+    // Vertical leader lines from the marker centers down to the measurement line, so it's
+    // visually clear that "this line corresponds to the marker centers".
+    group.appendChild(
+      SvgRenderer.line(x1, markerBottomY + 30, x1, measureY, {
+        stroke: color,
+        "stroke-width": "2",
+        "stroke-dasharray": "4 4",
+      }),
+    );
+    group.appendChild(
+      SvgRenderer.line(x2, markerBottomY + 30, x2, measureY, {
+        stroke: color,
+        "stroke-width": "2",
+        "stroke-dasharray": "4 4",
+      }),
+    );
+
+    // The measurement line itself.
+    group.appendChild(
+      SvgRenderer.line(x1, measureY, x2, measureY, {
+        stroke: color,
+        "stroke-width": stroke,
+      }),
+    );
+
+    // Tick caps at each end so the user can see exactly where the line begins and ends.
+    const tickH = 14;
+    group.appendChild(
+      SvgRenderer.line(x1, measureY - tickH, x1, measureY + tickH, {
+        stroke: color,
+        "stroke-width": stroke,
+      }),
+    );
+    group.appendChild(
+      SvgRenderer.line(x2, measureY - tickH, x2, measureY + tickH, {
+        stroke: color,
+        "stroke-width": stroke,
+      }),
+    );
+
+    group.appendChild(
+      SvgRenderer.text((x1 + x2) / 2, measureY + 36, "↑ measure this distance ↑", {
+        fill: color,
+        "text-anchor": "middle",
+        "font-size": "20",
+        "font-family": "monospace",
+        "font-weight": "bold",
+      }),
+    );
   }
 
   hide(): void {
