@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -39,6 +41,7 @@ from server.protocol import (
     CalibrationPromptEvent,
     CalibrationUpdatedEvent,
     CameraChangedEvent,
+    DetectedHand,
     DetectedObject,
     DetectionsEvent,
     FrameStatsEvent,
@@ -69,6 +72,39 @@ TRACK_GRACE_PERIOD_S = 1
 # band so the WS isn't chattering with sub-mm jitter while objects sit still.
 POSE_POS_EPSILON_MM = 1
 POSE_ANGLE_EPSILON_DEG = 0.1
+# When a marker stops being detected and a fingertip is over its last-known footprint,
+# we "glue" the marker to that fingertip so the overlay tracks the finger until either
+# the marker re-emerges or the user lifts the hand. Padding (mm) is added to the
+# marker's quad before the fingertip-inside test — small ArUco markers are easy to
+# miss the dead center of with a fingertip pad.
+GLUE_PAD_MM = 15
+# Drop a glue after this long even if the fingertip is still present. Bounds the
+# worst-case "marker is permanently lost but the hand still hovers" scenario; the
+# user can always re-glue by lifting and re-touching.
+GLUE_TIMEOUT_S = 2.0
+# MediaPipe Hand fingertip landmark indices: thumb, index, middle, ring, pinky.
+FINGERTIP_LANDMARK_INDICES = (4, 8, 12, 16, 20)
+
+
+@dataclass
+class GlueState:
+    """A marker is currently being dragged by this fingertip.
+
+    The translation each frame is `current_fingertip + offset`, so cumulative
+    drift can't accumulate — the offset is fixed at glue creation time.
+    """
+
+    handedness: str  # "Left" | "Right" (user's POV — see HandDetector)
+    landmark_idx: int  # which fingertip (one of FINGERTIP_LANDMARK_INDICES)
+    offset_from_fingertip_mm: tuple[float, float]  # marker_center - fingertip at glue time
+    created_ts: float
+
+
+@dataclass
+class TrackedObject:
+    last_obj: DetectedObject
+    last_seen_ts: float
+    glue: GlueState | None = None
 
 
 def _pose_changed(a: DetectedObject, b: DetectedObject) -> bool:
@@ -91,6 +127,59 @@ def _detections_changed(
         if _pose_changed(obj, previous[mid]):
             return True
     return False
+
+
+def _padded_corners_mm(obj: DetectedObject, pad_mm: float) -> np.ndarray:
+    """Push each corner outward from the marker center by pad_mm. Mirrors the UI's
+    PAD_MM expansion in overlay.ts so server- and client-side bbox math agree."""
+    cx, cy = obj.center_mm
+    out: list[list[float]] = []
+    for x, y in obj.corners_mm:
+        dx = x - cx
+        dy = y - cy
+        length = math.hypot(dx, dy) or 1.0
+        out.append([x + (dx / length) * pad_mm, y + (dy / length) * pad_mm])
+    return np.array(out, dtype=np.float32)
+
+
+def _translate_object(obj: DetectedObject, dx: float, dy: float) -> DetectedObject:
+    return DetectedObject(
+        marker_id=obj.marker_id,
+        corners_mm=[[c[0] + dx, c[1] + dy] for c in obj.corners_mm],
+        center_mm=[obj.center_mm[0] + dx, obj.center_mm[1] + dy],
+        angle_deg=obj.angle_deg,
+    )
+
+
+def _find_fingertip_over(
+    hands: list[DetectedHand], obj: DetectedObject, pad_mm: float
+) -> tuple[str, int, tuple[float, float]] | None:
+    """Find the fingertip closest to the marker center that lies inside the padded
+    quad. Returns (handedness, landmark_idx, position_mm) or None."""
+    quad = _padded_corners_mm(obj, pad_mm)
+    cx, cy = obj.center_mm
+    best: tuple[str, int, tuple[float, float], float] | None = None
+    for hand in hands:
+        for idx in FINGERTIP_LANDMARK_INDICES:
+            x, y = hand.landmarks_mm[idx]
+            if cv2.pointPolygonTest(quad, (float(x), float(y)), False) < 0:
+                continue
+            d2 = (x - cx) ** 2 + (y - cy) ** 2
+            if best is None or d2 < best[3]:
+                best = (hand.handedness, idx, (float(x), float(y)), d2)
+    if best is None:
+        return None
+    return best[0], best[1], best[2]
+
+
+def _find_fingertip_by_id(
+    hands: list[DetectedHand], handedness: str, landmark_idx: int
+) -> tuple[float, float] | None:
+    for hand in hands:
+        if hand.handedness == handedness:
+            x, y = hand.landmarks_mm[landmark_idx]
+            return (float(x), float(y))
+    return None
 
 
 class AppState:
@@ -125,10 +214,10 @@ class AppState:
         self._fps = 0.0
         self._detector_runs = 0
         self._last_detected_count = 0
-        # marker_id → (last DetectedObject, last_seen_ts). Used to apply the grace
-        # period during track mode so a single-frame detection miss doesn't cause the
-        # object's overlay to flicker off.
-        self._tracked_objects: dict[int, tuple[DetectedObject, float]] = {}
+        # marker_id → TrackedObject. Used to apply the grace period during track mode
+        # so a single-frame detection miss doesn't cause the object's overlay to
+        # flicker off, and to drag a marker with a fingertip while it's occluded.
+        self._tracked_objects: dict[int, TrackedObject] = {}
         # Snapshot of what was last broadcast, for change detection. Reset on mode
         # change so re-entering track mode always emits an initial broadcast.
         self._last_broadcast_objects: dict[int, DetectedObject] = {}
@@ -408,25 +497,89 @@ class AppState:
                         )
                         last_calib_broadcast = ts
                 elif self.mode == "track" and self.calibration is not None:
-                    # Detect on every frame. Broadcast only when something has actually
-                    # changed (new marker, marker disappeared past grace period, or pose
-                    # moved beyond sensor-noise thresholds) so we don't chatter the WS
-                    # with sub-mm jitter while objects sit still. Grace period applies
-                    # only to deletion — fresh poses overwrite entries on the same frame.
+                    # Detect objects + hands on every frame. Broadcast only when
+                    # something has actually changed (new marker, marker disappeared
+                    # past grace period, or pose moved beyond sensor-noise thresholds)
+                    # so we don't chatter the WS with sub-mm jitter while objects sit
+                    # still. Hand detection feeds the glue logic below — when a marker
+                    # disappears with a fingertip on it, we drag the marker with the
+                    # finger instead of letting it flicker off.
                     objects = self.detector.detect(frame, self.calibration)
                     self._detector_runs += 1
                     self._last_detected_count = len(objects)
                     now = now_ts()
+
+                    hands: list[DetectedHand] = []
+                    if self.hand_detector is not None:
+                        hands = self.hand_detector.detect(
+                            frame, self.calibration, int(ts * 1000)
+                        )
+
+                    # 1. Fresh detections always win: clear glue, refresh timestamp.
+                    fresh_ids: set[int] = set()
                     for obj in objects:
-                        self._tracked_objects[obj.marker_id] = (obj, now)
+                        fresh_ids.add(obj.marker_id)
+                        self._tracked_objects[obj.marker_id] = TrackedObject(
+                            last_obj=obj, last_seen_ts=now, glue=None
+                        )
+
+                    # 2. For tracked markers without a fresh detection: maintain or
+                    # establish a glue. Either path keeps last_seen_ts current so the
+                    # grace-period filter in step 3 doesn't drop the entry.
+                    for mid, t in self._tracked_objects.items():
+                        if mid in fresh_ids:
+                            continue
+                        if t.glue is None:
+                            match = _find_fingertip_over(hands, t.last_obj, GLUE_PAD_MM)
+                            if match is not None:
+                                handedness, idx, fingertip = match
+                                cx, cy = t.last_obj.center_mm
+                                t.glue = GlueState(
+                                    handedness=handedness,
+                                    landmark_idx=idx,
+                                    offset_from_fingertip_mm=(
+                                        cx - fingertip[0],
+                                        cy - fingertip[1],
+                                    ),
+                                    created_ts=now,
+                                )
+                                t.last_seen_ts = now
+                        else:
+                            if now - t.glue.created_ts > GLUE_TIMEOUT_S:
+                                t.glue = None
+                            else:
+                                fingertip = _find_fingertip_by_id(
+                                    hands, t.glue.handedness, t.glue.landmark_idx
+                                )
+                                if fingertip is None:
+                                    t.glue = None
+                                else:
+                                    new_cx = (
+                                        fingertip[0]
+                                        + t.glue.offset_from_fingertip_mm[0]
+                                    )
+                                    new_cy = (
+                                        fingertip[1]
+                                        + t.glue.offset_from_fingertip_mm[1]
+                                    )
+                                    dx = new_cx - t.last_obj.center_mm[0]
+                                    dy = new_cy - t.last_obj.center_mm[1]
+                                    t.last_obj = _translate_object(t.last_obj, dx, dy)
+                                    t.last_seen_ts = now
+
+                    # 3. Apply grace period — drop entries we haven't seen recently
+                    # (real detection or active glue both refresh last_seen_ts).
                     cutoff = now - TRACK_GRACE_PERIOD_S
                     self._tracked_objects = {
-                        mid: entry
-                        for mid, entry in self._tracked_objects.items()
-                        if entry[1] >= cutoff
+                        mid: t
+                        for mid, t in self._tracked_objects.items()
+                        if t.last_seen_ts >= cutoff
                     }
+
+                    # 4. Build the broadcast set — real detections plus glued positions
+                    # look identical on the wire.
                     current = {
-                        mid: entry[0] for mid, entry in self._tracked_objects.items()
+                        mid: t.last_obj for mid, t in self._tracked_objects.items()
                     }
                     if _detections_changed(current, self._last_broadcast_objects):
                         await self.bus.broadcast(
@@ -434,13 +587,9 @@ class AppState:
                         )
                         self._last_broadcast_objects = current
 
-                    # Hand detection runs every track-mode frame too. Broadcast every
-                    # frame a hand is present (we want low-latency skeleton tracking),
-                    # but emit only a single empty broadcast on the absent transition.
+                    # 5. Hand broadcast: every frame hands are present, plus a single
+                    # empty on the absent transition so the UI clears the skeleton.
                     if self.hand_detector is not None:
-                        hands = self.hand_detector.detect(
-                            frame, self.calibration, int(ts * 1000)
-                        )
                         if hands or self._last_hands_present:
                             await self.bus.broadcast(
                                 HandsEvent(hands=hands, ts=now)
