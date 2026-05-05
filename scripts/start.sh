@@ -34,7 +34,7 @@ UI_PID=$!
 
 sleep 2
 
-CONTROL_URL="http://localhost:$UI_PORT/control.html"
+CONTROL_URL="http://localhost:$UI_PORT/"
 echo "Control panel: $CONTROL_URL"
 open "$CONTROL_URL"
 

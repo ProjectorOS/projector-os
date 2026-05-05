@@ -1,5 +1,5 @@
 import { SvgRenderer } from "./render/svg-renderer";
-import type { CalibrationMarker } from "./types";
+import type { CalibrationMarker } from "../types";
 
 // The marker image returned by /markers/{id}.png includes a white quiet zone around
 // the ArUco marker — without it the marker's outer black edge would dissolve into the

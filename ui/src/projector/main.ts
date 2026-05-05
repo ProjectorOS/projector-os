@@ -1,15 +1,15 @@
 // Projector entry: draws calibration markers and tracked-object overlays. No controls
-// are rendered on the projection itself — those live in /control.html, opened in a
-// regular browser on the laptop.
+// are rendered on the projection itself — those live at / (the control panel),
+// opened in a regular browser on the laptop.
 
 import { CalibrationOverlay } from "./calibration";
 import { HandOverlay } from "./hand-overlay";
 import { TrackedObjectOverlay } from "./overlay";
 import { HtmlRenderer } from "./render/html-renderer";
 import { SvgRenderer } from "./render/svg-renderer";
-import type { Calibration, Mode, ServerEvent, WorkSurface } from "./types";
+import type { Calibration, Mode, ServerEvent, WorkSurface } from "../types";
 import { WorkSurfaceOverlay } from "./work-surface-overlay";
-import { defaultServerHttpUrl, defaultServerWsUrl, WsClient } from "./ws-client";
+import { defaultServerHttpUrl, defaultServerWsUrl, WsClient } from "../ws-client";
 
 class ProjectorApp {
   private mode: Mode = "idle";

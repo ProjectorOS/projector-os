@@ -1,6 +1,6 @@
 import { applyHomography } from "./render/homography";
 import { SvgRenderer } from "./render/svg-renderer";
-import type { Calibration, DetectedObject } from "./types";
+import type { Calibration, DetectedObject } from "../types";
 
 function computeMarkerEdgeMm(obj: DetectedObject): number {
   // Edge length in mat_mm. Falls back to a reasonable default if corners are degenerate.

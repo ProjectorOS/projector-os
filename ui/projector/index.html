@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ProjectorOS</title>
+    <style>
+      html, body { margin: 0; padding: 0; height: 100%; background: #000; color: #fff; overflow: hidden; }
+      body { font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif; }
+      #root, #svg-layer, #html-layer { position: fixed; inset: 0; width: 100vw; height: 100vh; }
+      #svg-layer { pointer-events: none; }
+      #html-layer { pointer-events: none; }
+      .control-panel {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        background: rgba(0,0,0,0.6);
+        border: 1px solid #444;
+        border-radius: 6px;
+        padding: 10px 14px;
+        font-size: 13px;
+        pointer-events: auto;
+        max-width: 320px;
+      }
+      .control-panel button {
+        margin: 4px 6px 4px 0;
+        padding: 4px 10px;
+        background: #222;
+        color: #fff;
+        border: 1px solid #555;
+        border-radius: 4px;
+        font-family: inherit;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      .control-panel button:hover { background: #333; }
+      .control-panel input { padding: 4px; background: #111; color: #fff; border: 1px solid #555; border-radius: 4px; width: 80px; }
+      .status { color: #8f8; }
+      .warn { color: #fb6; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <svg id="svg-layer" xmlns="http://www.w3.org/2000/svg"></svg>
+    <div id="html-layer"></div>
+    <script type="module" src="/src/projector/main.ts"></script>
+  </body>
+</html>
