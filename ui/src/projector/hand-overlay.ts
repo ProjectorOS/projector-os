@@ -1,6 +1,6 @@
 import { applyHomography } from "./render/homography";
 import { SvgRenderer } from "./render/svg-renderer";
-import type { Calibration, DetectedHand } from "./types";
+import type { Calibration, DetectedHand } from "../types";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 

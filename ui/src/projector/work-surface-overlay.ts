@@ -1,5 +1,5 @@
 import { SvgRenderer } from "./render/svg-renderer";
-import type { WorkSurface } from "./types";
+import type { WorkSurface } from "../types";
 
 /**
  * Draws a dashed rectangle around the work surface so the user can see the bounds of

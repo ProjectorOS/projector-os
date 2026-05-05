@@ -328,7 +328,7 @@ class AppState:
 
     def launch_projector(self, x: int, y: int, width: int, height: int) -> None:
         ui_port = int(os.environ.get("UI_PORT", "5173"))
-        ui_url = f"http://localhost:{ui_port}/"
+        ui_url = f"http://localhost:{ui_port}/projector/"
         self.launcher.launch(x, y, width, height, ui_url)
         self.preferences.projector_display = prefs_persist.ProjectorDisplay(
             x=x, y=y, width=width, height=height

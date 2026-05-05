@@ -3,46 +3,238 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>ProjectorOS</title>
-    <style>
-      html, body { margin: 0; padding: 0; height: 100%; background: #000; color: #fff; overflow: hidden; }
-      body { font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif; }
-      #root, #svg-layer, #html-layer { position: fixed; inset: 0; width: 100vw; height: 100vh; }
-      #svg-layer { pointer-events: none; }
-      #html-layer { pointer-events: none; }
-      .control-panel {
-        position: fixed;
-        top: 12px;
-        left: 12px;
-        background: rgba(0,0,0,0.6);
-        border: 1px solid #444;
-        border-radius: 6px;
-        padding: 10px 14px;
-        font-size: 13px;
-        pointer-events: auto;
-        max-width: 320px;
-      }
-      .control-panel button {
-        margin: 4px 6px 4px 0;
-        padding: 4px 10px;
-        background: #222;
-        color: #fff;
-        border: 1px solid #555;
-        border-radius: 4px;
-        font-family: inherit;
-        font-size: 12px;
-        cursor: pointer;
-      }
-      .control-panel button:hover { background: #333; }
-      .control-panel input { padding: 4px; background: #111; color: #fff; border: 1px solid #555; border-radius: 4px; width: 80px; }
-      .status { color: #8f8; }
-      .warn { color: #fb6; }
-    </style>
+    <title>ProjectorOS — Control</title>
+    <link rel="stylesheet" href="/control.css" />
   </head>
   <body>
-    <div id="root"></div>
-    <svg id="svg-layer" xmlns="http://www.w3.org/2000/svg"></svg>
-    <div id="html-layer"></div>
-    <script type="module" src="/src/main.ts"></script>
+    <div class="wrap">
+      <h1>ProjectorOS</h1>
+      <p class="subtitle">Control panel — runs in your laptop browser.</p>
+
+      <!-- Status card -->
+      <div class="card" data-card="status">
+        <h2>Status</h2>
+        <div class="kv">
+          <div class="k">Connection</div>
+          <div class="v" data-role="connection-pill"></div>
+          <div class="k">Mode</div>
+          <div class="v" data-role="mode-pill"></div>
+          <div class="k">Calibration</div>
+          <div class="v" data-role="calibration-status">not calibrated</div>
+        </div>
+      </div>
+
+      <!-- Projector display card -->
+      <div class="card" data-card="display">
+        <h2>Projector display</h2>
+
+        <!-- View shown when the projector window is open and the user isn't switching. -->
+        <div data-role="display-open" hidden>
+          <div class="row">
+            <span class="pill ok">Open</span>
+            <div class="v" data-role="display-open-label"></div>
+          </div>
+          <div class="row">
+            <button data-role="display-switch-btn">Switch display</button>
+            <button data-role="display-close-btn">Close projector window</button>
+          </div>
+        </div>
+
+        <!-- Picker view: shown when no projector is open, or when switching. -->
+        <div data-role="display-picker">
+          <div class="help" data-role="display-picker-help"></div>
+          <div class="help warn-text" data-role="display-picker-error" hidden></div>
+          <div class="displays" data-role="display-list"></div>
+          <div class="row">
+            <button data-role="display-refresh-btn">Refresh list</button>
+            <button data-role="display-cancel-btn" hidden>Cancel</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Work surface card (only shown when projector is registered) -->
+      <div class="card" data-card="work-surface" hidden>
+        <div class="card-header" data-role="ws-header">
+          <h2>Work surface</h2>
+          <span class="card-summary" data-role="ws-summary" hidden></span>
+          <span class="chevron" data-role="ws-chevron">▾</span>
+        </div>
+
+        <div class="kv">
+          <div class="k">Projector</div>
+          <div class="v" data-role="ws-projector">—</div>
+          <div class="k">Work surface</div>
+          <div class="v" data-role="ws-info">not set</div>
+        </div>
+
+        <div class="help">
+          Drag the dashed edges in the preview, or type margin values directly.
+          Changes apply when you release the edge or click Apply.
+        </div>
+
+        <div class="margin-grid">
+          <label class="margin-field">
+            <span class="k">Top</span>
+            <input type="number" min="0" step="1" placeholder="0" data-field="top" />
+          </label>
+          <label class="margin-field">
+            <span class="k">Bottom</span>
+            <input type="number" min="0" step="1" placeholder="0" data-field="bottom" />
+          </label>
+          <label class="margin-field">
+            <span class="k">Left</span>
+            <input type="number" min="0" step="1" placeholder="0" data-field="left" />
+          </label>
+          <label class="margin-field">
+            <span class="k">Right</span>
+            <input type="number" min="0" step="1" placeholder="0" data-field="right" />
+          </label>
+        </div>
+
+        <svg class="ws-preview" data-role="ws-preview" xmlns="http://www.w3.org/2000/svg">
+          <rect data-role="ws-outer" fill="#0a0c10" stroke="#475569" stroke-width="1" />
+          <rect data-role="ws-inner"
+                fill="rgba(74,222,128,0.08)" stroke="#4ade80"
+                stroke-width="1.5" stroke-dasharray="4 3" />
+          <rect data-edge="top"    fill="transparent" style="cursor: ns-resize" />
+          <rect data-edge="bottom" fill="transparent" style="cursor: ns-resize" />
+          <rect data-edge="left"   fill="transparent" style="cursor: ew-resize" />
+          <rect data-edge="right"  fill="transparent" style="cursor: ew-resize" />
+        </svg>
+
+        <label class="toggle-row">
+          <input type="checkbox" data-role="ws-show-outline" />
+          <span>Show outline on projector</span>
+        </label>
+
+        <div class="row">
+          <button class="primary" data-role="ws-apply-btn">Apply</button>
+          <button data-role="ws-reset-btn">Reset to full projection</button>
+        </div>
+      </div>
+
+      <!-- Camera card -->
+      <div class="card" data-card="camera">
+        <h2>Camera</h2>
+
+        <!-- View shown when a camera is open and the user isn't switching. -->
+        <div data-role="camera-live" hidden>
+          <div class="calib-preview" data-role="cam-preview">
+            <img data-role="cam-preview-img" alt="Camera preview" />
+            <svg class="calib-overlay" data-role="marker-overlay"
+                 preserveAspectRatio="xMidYMid meet"
+                 xmlns="http://www.w3.org/2000/svg" hidden></svg>
+          </div>
+          <div class="row">
+            <span class="pill ok">Live</span>
+            <div class="v" data-role="camera-live-label"></div>
+          </div>
+          <div class="heartbeat-row" data-role="heartbeat-row">
+            <span class="heartbeat stale" data-role="heartbeat-dot"></span>
+            <span class="heartbeat-text muted" data-role="heartbeat-text">waiting for frames…</span>
+          </div>
+          <div class="row">
+            <button data-role="camera-switch-btn">Switch camera</button>
+            <button data-role="camera-rotate-btn"
+                    title="Cycle preview rotation. Cosmetic only — does not affect calibration.">Rotate preview</button>
+            <button data-role="camera-preview-toggle-btn"
+                    title="Hides the preview + heartbeat without closing the camera. The server keeps capturing frames.">Close preview</button>
+          </div>
+        </div>
+
+        <!-- Picker view: shown when no camera is open, or when switching. -->
+        <div data-role="camera-picker">
+          <div class="row">
+            <span class="pill" data-role="camera-status-pill">Closed</span>
+            <div class="v" data-role="camera-status-label">no camera selected</div>
+          </div>
+          <div class="help" data-role="camera-picker-help"></div>
+          <div class="help warn-text" data-role="camera-error" hidden></div>
+          <div class="displays" data-role="camera-list"></div>
+          <div class="row">
+            <button data-role="camera-refresh-btn">Refresh list</button>
+            <button data-role="camera-cancel-btn" hidden>Cancel</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Mode card -->
+      <div class="card" data-card="mode">
+        <h2>Mode</h2>
+        <div class="row">
+          <button data-role="mode-idle-btn">Idle</button>
+          <button class="primary" data-role="mode-calibrate-btn">Calibrate</button>
+          <button data-role="mode-track-btn">Track</button>
+        </div>
+        <div class="help" data-role="mode-help" hidden></div>
+      </div>
+
+      <!-- Calibration card (visible only in calibrate mode) -->
+      <div class="card" data-card="calibration" hidden>
+        <h2>Calibration</h2>
+        <div class="help warn-text" data-role="calib-no-camera" hidden>
+          No camera open. Pick one in the Camera card above so the system can see
+          the projected markers.
+        </div>
+        <div class="help warn-text" data-role="calib-no-projector" hidden>
+          Projector window is not open. Launch it from the Projector display card
+          above so the markers can be projected.
+        </div>
+        <div data-role="calib-body">
+          <div class="row" data-role="calib-status"></div>
+          <div class="help" data-role="calib-diag-hint"></div>
+          <div class="row">
+            <input type="text"
+                   inputmode="decimal"
+                   placeholder="e.g. 305 or 12 in"
+                   autocomplete="off"
+                   data-role="measurement-input" />
+            <button class="primary" data-role="calib-save-btn" disabled>Save</button>
+          </div>
+          <div class="measurement-hint" data-role="measurement-hint"></div>
+        </div>
+      </div>
+
+      <!-- Track card (visible only in track mode) -->
+      <div class="card" data-card="track" hidden>
+        <h2>Tracked objects</h2>
+        <div class="objects">
+          <table>
+            <tbody data-role="detections-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Templates for repeated rows -->
+    <template id="tpl-display-row">
+      <div class="display-row">
+        <div class="display-info">
+          <div class="display-name"></div>
+          <div class="display-meta"></div>
+        </div>
+        <button class="primary" data-role="launch-btn"></button>
+      </div>
+    </template>
+
+    <template id="tpl-camera-row">
+      <div class="display-row">
+        <div class="display-info">
+          <div class="display-name"></div>
+          <div class="display-meta"></div>
+        </div>
+        <button data-role="use-btn"></button>
+      </div>
+    </template>
+
+    <template id="tpl-detection-row">
+      <tr>
+        <td class="id"></td>
+        <td data-role="position"></td>
+        <td data-role="angle"></td>
+      </tr>
+    </template>
+
+    <script type="module" src="/src/control/control.ts"></script>
   </body>
 </html>

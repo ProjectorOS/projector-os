@@ -6,8 +6,8 @@ A platform for projector + camera applications. The first application is a craft
 
 - **Python server** (`server/`) — camera capture, calibration math, ArUco detection, WebSocket fan-out.
 - **Browser UI** (`ui/`) — TypeScript + Vite, two entry points sharing the same WebSocket bus:
-  - **Projector view** at `/` — fullscreen kiosk on the projector display. Black background, SVG overlays, no on-screen controls.
-  - **Control panel** at `/control.html` — opened automatically in your default laptop browser by `scripts/start.sh`. Buttons for Idle / Calibrate / Track, calibration-measurement input, and a live list of detected objects. Either client can issue commands; both stay in sync via server broadcasts.
+  - **Control panel** at `/` — opened automatically in your default laptop browser by `scripts/start.sh`. Buttons for Idle / Calibrate / Track, calibration-measurement input, and a live list of detected objects. Either client can issue commands; both stay in sync via server broadcasts.
+  - **Projector view** at `/projector/` — fullscreen kiosk on the projector display. Black background, SVG overlays, no on-screen controls.
 - **Coordinate spaces:** `camera_px` (camera frame) → `mat_mm` (millimeters on the mat surface, canonical world frame) → `projector_px` (browser window). Two homographies persist in `data/calibration.json`.
 - **Work surface:** the projector often covers more area than the actual mat. A "work surface" rectangle (in projector pixels, persisted in `data/work_surface.json`) defines the workable subset. Calibration markers and content are positioned inside it; a dashed outline on the projector marks its bounds. Adjust margins from the **Work surface** card in the control panel.
 
@@ -28,7 +28,7 @@ cd ui && npm install && cd ..
 ./scripts/start.sh
 ```
 
-This boots the server + Vite dev server and opens the control panel (`/control.html`) in your default browser.
+This boots the server + Vite dev server and opens the control panel (`/`) in your default browser.
 
 The control panel includes a **Projector display** card listing every connected display (name, resolution, screen origin). Click "Launch" next to a display and the server opens a fullscreen Chromium kiosk on it. Use "Switch display" to relaunch on a different one, or "Close projector window" to dismiss it.
 
@@ -76,16 +76,20 @@ projectoros.org/
 │   ├── detection.py        ArUco object detector
 │   ├── bus.py              WS fan-out
 │   └── protocol.py         pydantic event/command models
-├── ui/                      TypeScript: projector view + control panel
-│   ├── index.html          projector entry (kiosk on projector)
-│   ├── control.html        control entry (laptop browser)
+├── ui/                          TypeScript: control panel + projector view
+│   ├── index.html              control panel entry (laptop browser, served at /)
+│   ├── control.css             control panel styles
+│   ├── projector/
+│   │   └── index.html          projector entry (kiosk, served at /projector/)
 │   └── src/
-│       ├── main.ts         projector renderer
-│       ├── control.ts      control-panel UI
-│       ├── ws-client.ts    shared reconnecting WS client
-│       ├── calibration.ts  draws calibration markers
-│       ├── overlay.ts      draws tracked-object outlines
-│       └── render/         renderer abstraction (SVG, HTML, Canvas)
+│       ├── ws-client.ts        shared reconnecting WS client
+│       ├── types.ts            shared protocol types
+│       ├── control/control.ts  control-panel UI
+│       └── projector/
+│           ├── main.ts         projector renderer
+│           ├── calibration.ts  draws calibration markers
+│           ├── overlay.ts      draws tracked-object outlines
+│           └── render/         renderer abstraction (SVG, HTML, Canvas)
 ├── scripts/start.sh
 └── data/calibration.json   (generated, gitignored)
 ```

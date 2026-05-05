@@ -21,8 +21,8 @@ If port 8000 is stuck after a crash: `pkill -9 -f "server.main"`. Don't sleep-an
 
 Two browser entry points, one server:
 
-- [ui/index.html](ui/index.html) → [ui/src/main.ts](ui/src/main.ts) — fullscreen projector kiosk. SVG overlays only, no controls.
-- [ui/control.html](ui/control.html) → [ui/src/control.ts](ui/src/control.ts) — control panel in laptop browser. All buttons/inputs live here.
+- [ui/index.html](ui/index.html) → [ui/src/control/control.ts](ui/src/control/control.ts) — control panel in laptop browser, served at `/`. All buttons/inputs live here.
+- [ui/projector/index.html](ui/projector/index.html) → [ui/src/projector/main.ts](ui/src/projector/main.ts) — fullscreen projector kiosk, served at `/projector/`. SVG overlays only, no controls.
 - [server/main.py](server/main.py) — FastAPI app, WS endpoint, frame loop, all HTTP endpoints (`/cameras`, `/displays`, `/markers/{id}.png`, `/camera/preview.mjpg`, `/launch_projector`, ...).
 
 Vite is configured for both entry points in [ui/vite.config.ts](ui/vite.config.ts) — if you add a third HTML page, add it to `rollupOptions.input`.
@@ -35,28 +35,28 @@ Three frames, two homographies (in [data/calibration.json](data/calibration.json
 - `mat_mm` — millimeters on the mat surface (canonical world frame)
 - `projector_px` — browser window pixels on the projector
 
-`H_cam_to_mat`, `H_mat_to_proj`. Apply with [applyHomography](ui/src/overlay.ts#L7) on the UI side. Tracked-object overlays compute geometry in `mat_mm` then transform to `projector_px` so physical distances stay consistent.
+`H_cam_to_mat`, `H_mat_to_proj`. Apply with [applyHomography](ui/src/projector/render/homography.ts) on the UI side. Tracked-object overlays compute geometry in `mat_mm` then transform to `projector_px` so physical distances stay consistent.
 
 The `work_surface` rectangle is in `projector_px` (persisted in [data/work_surface.json](data/work_surface.json)). Calibration markers are positioned inside it (see [server/calibration.py](server/calibration.py) `make_projection_layout`).
 
 ## Rendering: SVG first
 
-SVG is the default for projector overlays. Canvas is reserved for things SVG can't do (heavy per-frame pixel work). The renderer abstraction lives in [ui/src/render/](ui/src/render/) — use `SvgRenderer.upsert(id, render)` to add/replace a `<g>` group.
+SVG is the default for projector overlays. Canvas is reserved for things SVG can't do (heavy per-frame pixel work). The renderer abstraction lives in [ui/src/projector/render/](ui/src/projector/render/) — use `SvgRenderer.upsert(id, render)` to add/replace a `<g>` group.
 
-Overlays that draw inside the work surface should set `clip-path="url(#work-surface-clip)"` on the group (see [ui/src/main.ts](ui/src/main.ts) `updateClipRect`). Don't draw outside the work surface.
+Overlays that draw inside the work surface should set `clip-path="url(#work-surface-clip)"` on the group (see [ui/src/projector/main.ts](ui/src/projector/main.ts) `updateClipRect`). Don't draw outside the work surface.
 
-## Surgical DOM updates in the control panel
+## Control panel: static HTML, targeted updates
 
-This is the most important pattern in [ui/src/control.ts](ui/src/control.ts). `render()` does a full `innerHTML = ""` rebuild. If you call it on every WS event, every button loses focus and inputs get clobbered mid-typing.
+The control panel's structure (every card, button, input, SVG skeleton, table template) lives in [ui/index.html](ui/index.html). [ui/src/control/control.ts](ui/src/control/control.ts) does not rebuild the DOM — it caches references via `[data-role]` selectors at startup, attaches event handlers once, and mutates specific text/classes/attributes in response to WS events.
 
 Rules:
 
-1. **High-frequency events** (`frame_stats` ~1 Hz, `calibration_captured` ~6 Hz, `detections` ~20 Hz) early-return from `onEvent()` and call surgical updaters that look up nodes by `data-role` (e.g. `data-role="heartbeat-row"`, `data-role="detections-tbody"`).
-2. **Structural events** (mode changed, calibration saved, camera changed, work surface updated, display list changed) fall through to `render()`.
-3. `render()` skips entirely when `draggingEdge` is set (live work-surface drag) and captures/restores focus around the rebuild.
-4. Some DOM elements are persistent across renders — kept on the class, not recreated: `cameraPreviewImg` (avoids MJPEG reconnects), `measurementInput` (preserves typing state). When you remove them, also `null` the field.
+1. To add a new piece of UI, declare it in [ui/index.html](ui/index.html) with a `data-role="<name>"` hook (or `data-card`, `data-field`, `data-edge` for existing patterns) and look it up via the `q()` helper. Only inherently dynamic content (per-display rows, per-camera rows, marker-overlay polygons, table rows that vary in count) is built in TS; for repeated-row patterns, use a `<template>` element.
+2. State changes flow through `apply*()` methods (`applyConnection`, `applyMode`, `applyDisplayCard`, `applyWorkSurfaceCard`, `applyCameraCard`, `applyCalibrationCard`, `applyDetections`, `applyHeartbeat`). Each one reads `this.state` and writes only the parts of the DOM it owns.
+3. Show/hide cards and views by toggling the `hidden` attribute, not by removing nodes. Inputs (e.g. the measurement input) keep their value across visibility toggles, so no focus dance is needed.
+4. The MJPEG `<img data-role="cam-preview-img">` is in HTML; only its `src` attribute is set/cleared (via `cameraPreviewActive`) so the long-lived multipart request isn't reopened on every state change.
 
-If you add a new high-frequency event or a new control surface, follow the same pattern. Don't broadcast structural-looking events at high rates — split them.
+Don't reintroduce a full-DOM `render()` — the previous version did that and had to bolt on focus snapshots and persistent-element tracking to stay usable.
 
 ## Persistence
 
@@ -66,7 +66,7 @@ Server-side (gitignored, in `data/`):
 - `work_surface.json` — rect in projector_px
 - `preferences.json` — `camera_index`, `projector_display`, `show_work_surface_outline`
 
-Client-side (localStorage, prefix `projectoros.`): `workSurfaceCollapsed`, `previewRotation`, `previewHidden`, etc. Use `writeBool` / `readBool` helpers in [ui/src/control.ts](ui/src/control.ts) for consistency.
+Client-side (localStorage, prefix `projectoros.`): `workSurfaceCollapsed`, `previewRotation`, `previewHidden`, etc. Use `writeBool` / `readBool` helpers in [ui/src/control/control.ts](ui/src/control/control.ts) for consistency.
 
 ## ArUco markers
 
