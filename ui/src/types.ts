@@ -40,6 +40,22 @@ export interface WorkSurface {
   updated_at: number;
 }
 
+// Status of cutting-mat grid detection during calibration. Sent in every
+// CalibrationCapturedEvent so the UI can show whether passive grid-based
+// calibration is available. When `detected` is true, the user can finish
+// calibration without supplying a ruler measurement.
+export interface MatGridStatus {
+  detected: boolean;
+  grid_system: "metric" | "imperial" | null;
+  major_pitch_mm: number | null; // 10.0 (metric) or 25.4 (imperial)
+  subdivisions_per_major: number | null; // 10, 5, 2, 4, 8, or 16
+  pitch_cam_px_x: number | null;
+  pitch_cam_px_y: number | null;
+  intersection_count: number;
+  confidence: number;
+  reason: string | null; // populated when detected=false
+}
+
 export type ServerEvent =
   | {
       type: "hello";
@@ -63,6 +79,7 @@ export type ServerEvent =
       frame_width: number;
       frame_height: number;
       rejected_count: number;
+      mat_grid: MatGridStatus | null;
     }
   | { type: "projector_registered"; proj_width: number; proj_height: number }
   | { type: "work_surface_updated"; work_surface: WorkSurface; show_outline: boolean }
@@ -82,7 +99,9 @@ export type ClientCommand =
   | { type: "set_mode"; mode: Mode }
   | { type: "register_projector"; proj_width: number; proj_height: number }
   | { type: "start_calibration" }
-  | { type: "finish_calibration"; horizontal_mm: number }
+  // horizontal_mm is null/omitted when finishing via passive grid detection;
+  // the server derives mat dimensions from the detected grid in that case.
+  | { type: "finish_calibration"; horizontal_mm: number | null }
   | {
       type: "set_work_surface";
       x: number;

@@ -9,7 +9,14 @@
 //   - mutates specific bits of text / classes / attributes in response to
 //     server events and user input
 
-import type { Calibration, DetectedObject, Mode, ServerEvent, WorkSurface } from "../types";
+import type {
+  Calibration,
+  DetectedObject,
+  MatGridStatus,
+  Mode,
+  ServerEvent,
+  WorkSurface,
+} from "../types";
 import { defaultServerHttpUrl, defaultServerWsUrl, WsClient } from "../ws-client";
 
 interface Display {
@@ -71,6 +78,12 @@ interface ViewState {
   projector: [number, number] | null;
   capturedMarkers: number;
   calibDiag: CalibrationDiagnostic | null;
+  // Latest cutting-mat grid detection state from the server. null means no
+  // calibration_captured event has arrived yet this session.
+  matGrid: MatGridStatus | null;
+  // When true, the user has explicitly chosen the manual ruler flow even
+  // though a grid was detected. Reset on each start_calibration.
+  useRuler: boolean;
   detections: DetectedObject[];
   displays: Display[];
   displaysError: string | null;
@@ -101,6 +114,8 @@ class ControlApp {
     projector: null,
     capturedMarkers: 0,
     calibDiag: null,
+    matGrid: null,
+    useRuler: false,
     detections: [],
     displays: [],
     displaysError: null,
@@ -246,6 +261,14 @@ class ControlApp {
       if (ev.key === "Enter") this.commitMeasurement();
     });
     q("calib-save-btn").addEventListener("click", () => this.commitMeasurement());
+    q("use-ruler-toggle").addEventListener("click", () => {
+      this.state.useRuler = true;
+      this.applyCalibrationCard();
+    });
+    q("use-grid-toggle").addEventListener("click", () => {
+      this.state.useRuler = false;
+      this.applyCalibrationCard();
+    });
   }
 
   // ─── Server events ───────────────────────────────────────────────────────
@@ -273,6 +296,7 @@ class ControlApp {
           rejectedCount: ev.rejected_count,
           lastSeenAt: Date.now(),
         };
+        this.state.matGrid = ev.mat_grid;
         this.applyCalibrationCard();
         this.updateMarkerOverlay();
         return;
@@ -299,6 +323,8 @@ class ControlApp {
         if (ev.mode !== "calibrate") {
           this.state.capturedMarkers = 0;
           this.state.calibDiag = null;
+          this.state.matGrid = null;
+          this.state.useRuler = false;
         }
         this.applyMode();
         this.applyCalibrationCard();
@@ -313,6 +339,8 @@ class ControlApp {
       case "calibration_prompt":
         this.state.capturedMarkers = 0;
         this.state.calibDiag = null;
+        this.state.matGrid = null;
+        this.state.useRuler = false;
         this.applyCalibrationCard();
         this.updateMarkerOverlay();
         return;
@@ -730,7 +758,63 @@ class ControlApp {
         "Watch the live preview in the Camera card above — green outlines mark each detected marker.";
     }
 
-    q<HTMLButtonElement>("calib-save-btn").disabled = this.state.capturedMarkers < 4;
+    // Mat-grid (passive) calibration pill + ruler-input toggle.
+    // The passive path is offered when (a) all 4 ArUco markers are visible
+    // (so we have a quad anchor), (b) the server reports a reliable grid
+    // detection, and (c) the user hasn't explicitly opted into the ruler
+    // flow. Otherwise we fall back to the existing ruler input.
+    const gridPill = q("calib-grid-pill");
+    const measureRow = q("calib-measure-row");
+    const useRulerToggle = q<HTMLButtonElement>("use-ruler-toggle");
+    const useGridToggle = q<HTMLButtonElement>("use-grid-toggle");
+    const grid = this.state.matGrid;
+    const passiveAvailable =
+      this.state.capturedMarkers === 4 &&
+      grid !== null &&
+      grid.detected &&
+      !this.state.useRuler;
+    if (passiveAvailable && grid) {
+      gridPill.hidden = false;
+      gridPill.replaceChildren();
+      const span = document.createElement("span");
+      span.className = "pill ok";
+      span.textContent = describeGrid(grid);
+      gridPill.appendChild(span);
+      measureRow.hidden = true;
+      useRulerToggle.hidden = false;
+      useGridToggle.hidden = true;
+    } else {
+      // Either no grid was detected, or the user toggled to ruler mode.
+      // Surface the detection state if it's informative (helps the user
+      // adjust mat position / lighting), but stay out of the way otherwise.
+      if (grid && !grid.detected && grid.reason && this.state.capturedMarkers === 4) {
+        gridPill.hidden = false;
+        gridPill.replaceChildren();
+        const span = document.createElement("span");
+        span.className = "pill muted";
+        span.textContent = "Mat grid not detected";
+        gridPill.appendChild(span);
+      } else if (this.state.useRuler && grid && grid.detected) {
+        // User dismissed an available grid; offer to switch back.
+        gridPill.hidden = false;
+        gridPill.replaceChildren();
+        const span = document.createElement("span");
+        span.className = "pill muted";
+        span.textContent = "Using ruler — grid available";
+        gridPill.appendChild(span);
+      } else {
+        gridPill.hidden = true;
+        gridPill.replaceChildren();
+      }
+      measureRow.hidden = false;
+      useRulerToggle.hidden = true;
+      useGridToggle.hidden = !(this.state.useRuler && grid && grid.detected);
+    }
+
+    // Save button: passive path always enabled when offered; active path
+    // requires 4 markers (existing behavior).
+    q<HTMLButtonElement>("calib-save-btn").disabled =
+      passiveAvailable ? false : this.state.capturedMarkers < 4;
     this.refreshMeasurementHint();
   }
 
@@ -989,9 +1073,18 @@ class ControlApp {
   }
 
   private commitMeasurement(): void {
+    if (this.state.capturedMarkers !== 4) return;
+    const grid = this.state.matGrid;
+    const passiveAvailable =
+      grid !== null && grid.detected && !this.state.useRuler;
+    if (passiveAvailable) {
+      // Passive grid path: server derives mat dimensions from the detected
+      // grid pitch, no ruler measurement needed.
+      this.ws.send({ type: "finish_calibration", horizontal_mm: null });
+      return;
+    }
     const mm = parseLengthMm(this.pendingMm);
     if (mm === null || mm <= 0) return;
-    if (this.state.capturedMarkers !== 4) return;
     this.ws.send({ type: "finish_calibration", horizontal_mm: mm });
     this.pendingMm = "";
     q<HTMLInputElement>("measurement-input").value = "";
@@ -1063,6 +1156,26 @@ function parsePending(p: PendingMargins): { left: number; top: number; right: nu
 
 function clamp(v: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, v));
+}
+
+/**
+ * Build the user-facing description of a detected mat grid for the calibration
+ * card pill, e.g. "Metric mat detected · 10 mm grid (1 mm subdivisions)" or
+ * "Imperial mat detected · 1 inch grid (¼ inch subdivisions)".
+ */
+function describeGrid(grid: MatGridStatus): string {
+  if (!grid.detected || !grid.grid_system || grid.subdivisions_per_major === null) {
+    return "Mat grid detected";
+  }
+  const n = grid.subdivisions_per_major;
+  if (grid.grid_system === "metric") {
+    const minor = n === 10 ? "1 mm" : n === 5 ? "2 mm" : `${n} subdivisions`;
+    return `Metric mat detected · 10 mm grid (${minor} subdivisions)`;
+  }
+  // imperial
+  const fraction =
+    n === 2 ? "½ inch" : n === 4 ? "¼ inch" : n === 8 ? "⅛ inch" : n === 16 ? "1⁄16 inch" : `${n} per inch`;
+  return `Imperial mat detected · 1 inch grid (${fraction} subdivisions)`;
 }
 
 /**

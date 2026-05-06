@@ -182,14 +182,30 @@
         </div>
         <div data-role="calib-body">
           <div class="row" data-role="calib-status"></div>
+          <!-- Mat-grid detection pill. Hidden until the server reports a
+               classification (or a non-trivial reason). When a grid is
+               detected, the measurement input below is hidden in favor of
+               a one-click Save (server derives mm from the grid pitch). -->
+          <div class="row" data-role="calib-grid-pill" hidden></div>
           <div class="help" data-role="calib-diag-hint"></div>
-          <div class="row">
+          <!-- The measurement input is hidden when grid detection is active.
+               The Save button below is always visible so the user can commit
+               either path with a single button. -->
+          <div class="row" data-role="calib-measure-row">
             <input type="text"
                    inputmode="decimal"
                    placeholder="e.g. 305 or 12 in"
                    autocomplete="off"
                    data-role="measurement-input" />
+          </div>
+          <div class="row">
             <button class="primary" data-role="calib-save-btn" disabled>Save</button>
+            <button type="button" class="link-btn" data-role="use-ruler-toggle" hidden>
+              Use ruler instead
+            </button>
+            <button type="button" class="link-btn" data-role="use-grid-toggle" hidden>
+              Use grid detection
+            </button>
           </div>
           <div class="measurement-hint" data-role="measurement-hint"></div>
         </div>

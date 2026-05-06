@@ -47,8 +47,12 @@ In the **control panel** (laptop browser):
 
 1. Click **Calibrate**. The server tells the projector view to draw 4 ArUco markers (IDs 10–13) at known projector-pixel positions near the corners of the projection.
 2. The camera detects them automatically — the calibration card shows "All 4 markers detected" once it's stable.
-3. With a ruler, measure the **horizontal mm distance between the centers of the top-left and top-right markers** on the mat. Type the number and click **Save**.
+3. **One of two paths**, depending on what your mat looks like:
+   - **Mat-grid (passive)** — if your cutting mat has a printed grid and the camera can see it clearly, the calibration card shows e.g. "Metric mat detected · 10 mm grid (1 mm subdivisions)" or "Imperial mat detected · 1 inch grid (¼ inch subdivisions)". Just click **Save**. No ruler needed. Click "Use ruler instead" to fall back to the manual flow.
+   - **Ruler (active)** — if no grid is detected, measure the **horizontal mm distance between the centers of the top-left and top-right markers** on the mat with a ruler, type the number, and click **Save**.
 4. The server computes `H_cam_to_mat` and `H_mat_to_proj`, persists them to `data/calibration.json`, and switches to track mode.
+
+**Mat-grid classification:** the system distinguishes metric vs imperial mats by counting subdivisions per major cell — `10` or `5` minor lines per cell → metric (10 mm major), `2/4/8/16` → imperial (1 inch major). Anything else falls back silently to the ruler flow.
 
 **Assumption (v1):** the projection on the mat is approximately rectangular (projector roughly perpendicular to mat). Heavy keystoning will skew the calibration; use the projector's keystone correction setting to flatten it before calibrating.
 
@@ -97,6 +101,5 @@ projectoros.org/
 ## What's not in v1
 
 - Open-vocabulary object recognition (OWL-ViT / YOLO) — the ArUco interface in `server/detection.py` is the swap point.
-- Hand / gesture detection (MediaPipe Hands) — separate detection module on the same WS bus.
 - Workflow / instruction UI (recipe-style step engine).
-- Mat-grid-based passive calibration.
+- Mat brand/model classifier (handles long-tail mats the geometric grid detector can't classify).

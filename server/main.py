@@ -21,11 +21,17 @@ from server import work_surface as ws_persist
 from server.bus import Bus
 from server.calibration import (
     CALIBRATION_MARKER_INNER_PX,
+    CALIBRATION_MARKER_IDS,
     CALIBRATION_MARKER_QUIET_ZONE_PX,
     CALIBRATION_MARKER_TOTAL_PX,
+    MAT_GRID_CONFIDENCE_MIN,
+    MatGridCapture,
     average_captures,
     compute_calibration,
+    compute_passive_calibration,
+    detect_mat_grid,
     detect_projected_markers,
+    grid_capture_to_status,
     load_calibration,
     make_projection_layout,
     save_calibration,
@@ -47,6 +53,7 @@ from server.protocol import (
     FrameStatsEvent,
     HandsEvent,
     HelloEvent,
+    MatGridStatus,
     Mode,
     ModeChangedEvent,
     ProjectorRegisteredEvent,
@@ -266,6 +273,14 @@ class AppState:
         self._calibration_proj_w: int = 0
         self._calibration_proj_h: int = 0
         self._calibration_captures: list = []
+        # Passive (mat-grid) calibration: latest successful grid detection plus
+        # the wall-clock timestamp it was observed at. Stored as the latest
+        # successful capture only — the detector runs every frame and updates
+        # this slot whenever it finds a reliable grid; staleness is checked
+        # in finish_calibration. None = no grid currently detected.
+        self._last_grid_capture: MatGridCapture | None = None
+        self._last_grid_capture_ts: float = 0.0
+        self._latest_grid_status: MatGridStatus | None = None
         self._loop_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
         # Frame-loop instrumentation (used by the heartbeat broadcast).
@@ -475,6 +490,9 @@ class AppState:
         self._calibration_proj_h = proj_h
         self._calibration_layout = make_projection_layout(self.work_surface)
         self._calibration_captures.clear()
+        self._last_grid_capture = None
+        self._last_grid_capture_ts = 0.0
+        self._latest_grid_status = None
         await self.set_mode("calibrate")
         await self.bus.broadcast(
             CalibrationPromptEvent(
@@ -483,18 +501,50 @@ class AppState:
             )
         )
 
-    async def finish_calibration(self, horizontal_mm: float) -> None:
+    async def finish_calibration(self, horizontal_mm: float | None) -> None:
         if not self._calibration_captures:
             log.warning("finish_calibration called but no marker captures yet")
             return
         averaged = average_captures(self._calibration_captures)
-        calib = compute_calibration(
-            capture=averaged,
-            layout=self._calibration_layout,
-            proj_w=self._calibration_proj_w,
-            proj_h=self._calibration_proj_h,
-            horizontal_mm=horizontal_mm,
+        # Passive path: no horizontal_mm supplied AND we have a recent reliable
+        # grid capture. Else fall back to the active (ruler-measurement) path.
+        grid = self._last_grid_capture
+        grid_fresh = (
+            grid is not None
+            and grid.detected
+            and grid.confidence >= MAT_GRID_CONFIDENCE_MIN
+            and (time.time() - self._last_grid_capture_ts) < 2.0
         )
+        if horizontal_mm is None:
+            if not grid_fresh or grid is None:
+                log.warning(
+                    "finish_calibration omitted horizontal_mm but no fresh grid "
+                    "capture is available — refusing to calibrate"
+                )
+                return
+            log.info(
+                "finishing calibration via passive grid (%s, %d subdivisions, "
+                "%d intersections, confidence=%.2f)",
+                grid.grid_system,
+                grid.subdivisions_per_major,
+                int(grid.intersections_cam.shape[0]),
+                grid.confidence,
+            )
+            calib = compute_passive_calibration(
+                aruco_capture=averaged,
+                grid_capture=grid,
+                layout=self._calibration_layout,
+                proj_w=self._calibration_proj_w,
+                proj_h=self._calibration_proj_h,
+            )
+        else:
+            calib = compute_calibration(
+                capture=averaged,
+                layout=self._calibration_layout,
+                proj_w=self._calibration_proj_w,
+                proj_h=self._calibration_proj_h,
+                horizontal_mm=horizontal_mm,
+            )
         save_calibration(calib, CALIBRATION_PATH)
         self.calibration = calib
         await self.bus.broadcast(CalibrationUpdatedEvent(calibration=calib))
@@ -540,6 +590,43 @@ class AppState:
                         self._calibration_captures.append(capture)
                         if len(self._calibration_captures) > 10:
                             self._calibration_captures.pop(0)
+                        # Run mat-grid detection only when all 4 ArUco markers
+                        # are visible — the quad bounding box is what we crop
+                        # to, and the TL→TR direction is the sanity-check
+                        # baseline for grid axis alignment.
+                        aruco_quad = np.array(
+                            [
+                                capture.cam_corners_by_id[mid].mean(axis=0)
+                                for mid in CALIBRATION_MARKER_IDS
+                            ],
+                            dtype=np.float64,
+                        )
+                        try:
+                            grid_capture = detect_mat_grid(frame, aruco_quad)
+                        except Exception as e:  # noqa: BLE001 — never let grid
+                            # detection take down the calibrate loop. Silently
+                            # fall back to the ruler flow if anything goes
+                            # wrong inside the detector.
+                            log.warning("mat-grid detector raised: %s", e)
+                            grid_capture = MatGridCapture.failure(
+                                f"detector error: {e}"
+                            )
+                        self._latest_grid_status = grid_capture_to_status(
+                            grid_capture
+                        )
+                        if (
+                            grid_capture.detected
+                            and grid_capture.confidence >= MAT_GRID_CONFIDENCE_MIN
+                        ):
+                            self._last_grid_capture = grid_capture
+                            self._last_grid_capture_ts = ts
+                    else:
+                        # No quad → can't crop, can't sanity-check. Surface
+                        # this state to the UI so the grid pill stays hidden.
+                        self._latest_grid_status = MatGridStatus(
+                            detected=False,
+                            reason="waiting for 4 ArUco markers",
+                        )
                     if ts - last_calib_broadcast >= calib_interval:
                         h, w = frame.shape[:2]
                         ids = sorted(capture.cam_corners_by_id.keys())
@@ -553,6 +640,7 @@ class AppState:
                                 frame_width=w,
                                 frame_height=h,
                                 rejected_count=capture.rejected_count,
+                                mat_grid=self._latest_grid_status,
                             )
                         )
                         last_calib_broadcast = ts
@@ -828,7 +916,9 @@ async def ws_endpoint(ws: WebSocket) -> None:
             elif mtype == "start_calibration":
                 await state.start_calibration()
             elif mtype == "finish_calibration":
-                await state.finish_calibration(float(msg["horizontal_mm"]))
+                raw_mm = msg.get("horizontal_mm")
+                horizontal_mm = float(raw_mm) if raw_mm is not None else None
+                await state.finish_calibration(horizontal_mm)
             elif mtype == "set_work_surface":
                 await state.set_work_surface(
                     int(msg["x"]),

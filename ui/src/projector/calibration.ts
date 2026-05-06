@@ -12,7 +12,20 @@ export class CalibrationOverlay {
     private readonly serverBaseUrl: string,
   ) {}
 
-  show(markers: CalibrationMarker[], markerSizePx: number): void {
+  /**
+   * Render the four ArUco markers, their amber zone outlines, and (when
+   * `drawMeasurementGuide` is true) the "↑ measure this distance ↑" guide
+   * between markers 10 and 11.
+   *
+   * Pass `drawMeasurementGuide=false` once a cutting-mat grid has been
+   * reliably detected — the user no longer needs to ruler-measure anything,
+   * so the guide is just visual noise on the mat.
+   */
+  show(
+    markers: CalibrationMarker[],
+    markerSizePx: number,
+    drawMeasurementGuide: boolean = true,
+  ): void {
     this.svg.upsert("calibration", (group: SVGGElement) => {
       group.setAttribute("clip-path", "url(#work-surface-clip)");
       const half = markerSizePx / 2;
@@ -63,7 +76,9 @@ export class CalibrationOverlay {
         group.appendChild(label);
       }
 
-      this.drawMeasurementGuide(group, markers, markerSizePx);
+      if (drawMeasurementGuide) {
+        this.drawMeasurementGuide(group, markers, markerSizePx);
+      }
     });
   }
 

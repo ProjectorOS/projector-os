@@ -191,6 +191,21 @@ input[type="text"][data-role="measurement-input"] {
   color: var(--muted);
 }
 
+/* Inline secondary action — used for "Use ruler instead" / "Use grid detection"
+   toggles inside the calibration card. Looks like a link, behaves like a button. */
+button.link-btn {
+  background: transparent;
+  border: 0;
+  padding: 0 4px;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  text-decoration: underline;
+}
+button.link-btn:hover {
+  color: var(--accent);
+}
+
 .help {
   color: var(--muted);
   font-size: 12px;

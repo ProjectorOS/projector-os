@@ -94,6 +94,30 @@ class CalibrationPromptEvent(BaseModel):
     marker_size_px: int  # how many projector pixels each marker image (incl. white quiet zone) occupies
 
 
+class MatGridStatus(BaseModel):
+    """Status of cutting-mat grid detection during calibration.
+
+    Sent on every CalibrationCapturedEvent so the UI can show whether passive
+    grid-based calibration is available. When `detected` is true, the system
+    can finish calibration without a user ruler measurement.
+
+    Classification rules (subdivisions = minor lines per major cell):
+      - 10 or 5  → metric  (major_pitch_mm = 10.0)
+      - 2/4/8/16 → imperial (major_pitch_mm = 25.4)
+      - anything else → not detected, `reason` populated
+    """
+
+    detected: bool
+    grid_system: Literal["metric", "imperial"] | None = None
+    major_pitch_mm: float | None = None  # 10.0 (metric) or 25.4 (imperial)
+    subdivisions_per_major: int | None = None  # 10, 5, 2, 4, 8, or 16
+    pitch_cam_px_x: float | None = None
+    pitch_cam_px_y: float | None = None
+    intersection_count: int = 0
+    confidence: float = 0.0
+    reason: str | None = None  # populated when detected = False
+
+
 class CalibrationCapturedEvent(BaseModel):
     """Diagnostic broadcast at ~6 Hz while in calibrate mode.
 
@@ -108,6 +132,7 @@ class CalibrationCapturedEvent(BaseModel):
     frame_width: int = 0
     frame_height: int = 0
     rejected_count: int = 0  # quads found but not decoded — useful when detected count = 0
+    mat_grid: MatGridStatus | None = None  # null when not yet evaluated
 
 
 class ProjectorRegisteredEvent(BaseModel):
@@ -181,10 +206,17 @@ class StartCalibrationCommand(BaseModel):
 
 
 class FinishCalibrationCommand(BaseModel):
-    """Sent by any client once the user has measured the on-mat horizontal distance between TL and TR markers."""
+    """Sent by any client to finish calibration.
+
+    Two paths:
+      - Active (current): the user measured the on-mat horizontal distance between
+        markers 10 and 11 with a ruler and provides `horizontal_mm`.
+      - Passive (when a cutting-mat grid was reliably detected): `horizontal_mm`
+        is omitted and the server derives the mm scale from the detected grid.
+    """
 
     type: Literal["finish_calibration"] = "finish_calibration"
-    horizontal_mm: float
+    horizontal_mm: float | None = None
 
 
 class SetWorkSurfaceCommand(BaseModel):

@@ -7,7 +7,7 @@ import { HandOverlay } from "./hand-overlay";
 import { TrackedObjectOverlay } from "./overlay";
 import { HtmlRenderer } from "./render/html-renderer";
 import { SvgRenderer } from "./render/svg-renderer";
-import type { Calibration, Mode, ServerEvent, WorkSurface } from "../types";
+import type { CalibrationMarker, Calibration, Mode, ServerEvent, WorkSurface } from "../types";
 import { WorkSurfaceOverlay } from "./work-surface-overlay";
 import { defaultServerHttpUrl, defaultServerWsUrl, WsClient } from "../ws-client";
 
@@ -16,6 +16,13 @@ class ProjectorApp {
   private calibration: Calibration | null = null;
   private workSurface: WorkSurface | null = null;
   private showWorkSurfaceOutline = true;
+  // Cached calibration_prompt payload so we can re-invoke `show()` when the
+  // mat-grid detection state flips (and we want to drop the measurement guide).
+  private calibrationMarkers: CalibrationMarker[] | null = null;
+  private calibrationMarkerSizePx = 0;
+  // Last-seen mat-grid detection flag from calibration_captured. We only
+  // re-render the overlay when this transitions, not on every 6 Hz event.
+  private gridDetected = false;
 
   private readonly svg: SvgRenderer;
   private readonly html: HtmlRenderer;
@@ -122,7 +129,10 @@ class ProjectorApp {
         this.calibration = ev.calibration;
         break;
       case "calibration_prompt":
-        this.calibrationOverlay.show(ev.markers, ev.marker_size_px);
+        this.calibrationMarkers = ev.markers;
+        this.calibrationMarkerSizePx = ev.marker_size_px;
+        this.gridDetected = false;
+        this.calibrationOverlay.show(ev.markers, ev.marker_size_px, true);
         break;
       case "work_surface_updated":
         this.workSurface = ev.work_surface;
@@ -130,7 +140,26 @@ class ProjectorApp {
         this.updateClipRect();
         this.refreshOverlay();
         break;
-      case "calibration_captured":
+      case "calibration_captured": {
+        // Re-render the overlay only on a grid-detection flip — once the
+        // server confirms a reliable grid, we drop the "measure this" guide
+        // (the user no longer needs to ruler-measure anything). When the
+        // grid disappears we put the guide back.
+        const detected = ev.mat_grid?.detected === true;
+        if (
+          detected !== this.gridDetected &&
+          this.calibrationMarkers !== null &&
+          this.calibrationMarkerSizePx > 0
+        ) {
+          this.gridDetected = detected;
+          this.calibrationOverlay.show(
+            this.calibrationMarkers,
+            this.calibrationMarkerSizePx,
+            !detected,
+          );
+        }
+        break;
+      }
       case "projector_registered":
         // No-op for the projector view.
         break;

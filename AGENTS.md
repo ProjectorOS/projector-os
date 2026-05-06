@@ -74,6 +74,32 @@ Client-side (localStorage, prefix `projectoros.`): `workSurfaceCollapsed`, `prev
 - Marker PNGs served from [server/main.py](server/main.py) include a **white quiet zone** around the inner ArUco bits. Without it the outer black border dissolves into the projector's black background and detection silently returns nothing. Constants in [server/calibration.py](server/calibration.py): `CALIBRATION_MARKER_INNER_PX=200`, `CALIBRATION_MARKER_QUIET_ZONE_PX=100`, `CALIBRATION_MARKER_TOTAL_PX=400`. If you change these, also update the projection layout inset.
 - The detector uses subpixel corner refinement; rejected-quad count is broadcast in `calibration_captured` so users can tell whether OpenCV is seeing anything at all.
 
+## Calibration paths
+
+There are **two** ways calibration finishes:
+
+1. **Active (ruler)** — original flow. User reads the on-mat distance between markers 10 and 11 and types it into the calibration card. `FinishCalibrationCommand.horizontal_mm` is the measurement.
+2. **Passive (mat grid)** — added in the cutting-mat-grid feature. When the printed grid on the mat is detected and classified during calibrate mode, the user clicks Save without typing anything; `FinishCalibrationCommand.horizontal_mm` is `null` and the server derives mat dimensions from the detected grid pitch.
+
+Both paths produce the same `Calibration` schema in [data/calibration.json](data/calibration.json). The ArUco markers are still projected in both cases — they remain the only thing pinning `projector_px` to `mat_mm`. The grid only replaces the ruler measurement.
+
+### Mat-grid detection — what to know before changing it
+
+In [server/calibration.py](server/calibration.py): `detect_mat_grid()` runs alongside the ArUco detector during calibrate mode (only when 4 markers are visible — the quad is the ROI and the TL→TR direction is the axis-alignment sanity check). On success it returns a `MatGridCapture` with major-line pitch in `cam_px` for both axes plus a `subdivisions_per_major` count. `compute_passive_calibration()` builds a coarse `H_cam_to_mat` from the ArUco corners, snaps detected grid intersections to the major-pitch lattice in `mat_mm`, refits via `cv2.findHomography(method=cv2.RANSAC)` over many points, then derives `H_mat_to_proj`.
+
+Conventions and gotchas:
+
+- **Grid system is auto-classified** by subdivisions-per-major-cell:
+  - `10` or `5` → **metric**, major pitch = 10 mm (1 mm or 2 mm minor lines)
+  - `2`, `4`, `8`, `16` → **imperial**, major pitch = 25.4 mm (½, ¼, ⅛, ⅟₁₆ inch)
+  - anything else → not detected, `MatGridStatus.reason` is populated, system silently falls back to the ruler flow.
+- **Silent fallback is the contract.** If the detector can't classify the grid for any reason — low contrast, axes not separable, axes not aligned with the ArUco quad, ambiguous subdivision count, exception in OpenCV — `detected=False` and the user keeps the existing ruler input. Never throw out of the calibrate frame loop; the server wraps `detect_mat_grid` in `try/except` for this reason.
+- **Confidence gating.** `finish_calibration` accepts the passive path only when the most recent grid capture has `confidence >= MAT_GRID_CONFIDENCE_MIN` (0.7) **and** is fresher than 2 seconds. If you change the gating, mirror the change in `applyCalibrationCard`'s `passiveAvailable` check (control panel) so the UI doesn't offer a passive Save the server will reject.
+- **Subdivision counting is the discriminator, not pitch in pixels.** Don't try to infer mm from cam-px pitch alone — there's no ground truth without either the grid system (this approach) or a user measurement. If you add new mat formats, edit `MAT_GRID_METRIC_SUBDIVISIONS` / `MAT_GRID_IMPERIAL_SUBDIVISIONS` and the `_classify_grid_system` table; don't add probabilistic guessing.
+- **UI state on the control panel:** `state.matGrid` (last `MatGridStatus` from the server) and `state.useRuler` (the user opted out of the passive path even though it was offered). Both reset on `start_calibration` / `mode_changed != "calibrate"` / `calibration_prompt`. The Save button always sits below the measurement input — only the input row is hidden when grid detection is active.
+- **Projector overlay:** `CalibrationOverlay.show()` takes a `drawMeasurementGuide: boolean`. The projector toggles this when `calibration_captured.mat_grid.detected` flips, *not* on every 6 Hz event — it caches the prompt payload in [ui/src/projector/main.ts](ui/src/projector/main.ts) (`calibrationMarkers`, `calibrationMarkerSizePx`, `gridDetected`) and re-invokes `show()` only on the transition.
+- **Future work** for grid coverage (mat-profile JSON database, brand-name OCR, classifier model) is documented in `~/.claude/plans/add-cutting-mat-grid-noble-crown.md` under "Future enhancements". Don't add an ML classifier without first considering the cheaper paths there — the failure mode of a confidently-misclassifying model is worse than the geometric detector's silent fallback.
+
 ## macOS specifics
 
 - **Camera enumeration:** `system_profiler -json SPCameraDataType` ([server/cameras.py](server/cameras.py)). The JXA `AVCaptureDevice` bridge is broken on modern macOS — don't try it.
