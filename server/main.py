@@ -35,6 +35,8 @@ from server.calibration import (
     detect_calibration_dots,
     detect_mat_grid,
     detect_projected_markers,
+    GridDetectionParams,
+    MERGE_METHODS,
     grid_capture_to_status,
     load_calibration,
     make_projection_layout,
@@ -316,6 +318,27 @@ class AppState:
         # detector against a particular cutting-mat + camera setup before (or
         # outside of) the regular ArUco-gated calibration flow.
         self._detect_grid_pending: bool = False
+        # Which pipeline-stage layers the grid-debug preview should paint.
+        # Toggled from the UI via SetGridDebugLayersCommand. All on by
+        # default; not persisted across server restarts.
+        self._grid_debug_layers: set[str] = {
+            "weak",
+            "strong",
+            "axis_x",
+            "axis_y",
+            "diagonals",
+            "intersections",
+        }
+        # Live-tunable detector knobs (sliders in the UI). Defaults match the
+        # historical hardcoded values; not persisted across server restarts
+        # so a fresh process is always behavior-identical to the old code
+        # until the UI pushes its localStorage-backed values.
+        self._line_merge_tolerance_px: float = 6.0
+        self._hough_strong_ratio: float = 0.4
+        self._hough_weak_ratio: float = 0.15
+        self._line_merge_method: str = "longest"
+        self._pitch_cv_max: float = 0.10
+        self._line_extend_fraction: float = 0.20
         # Most recent grid_capture from the per-frame detector — success OR
         # failure. The success-only `_last_grid_capture` is used for finishing
         # calibration; this one is for diagnostic broadcast / overlay
@@ -558,6 +581,57 @@ class AppState:
         """Queue a one-shot mat-grid detection on the next frame; result broadcast as MatGridDetectedEvent."""
         self._detect_grid_pending = True
 
+    def set_grid_debug_layers(self, enabled: list[str]) -> None:
+        """Replace the active grid-debug layer set. Unknown names are dropped
+        silently — the UI uses the closed set defined here."""
+        valid = {"weak", "strong", "axis_x", "axis_y", "diagonals", "intersections"}
+        self._grid_debug_layers = {name for name in enabled if name in valid}
+
+    def set_grid_detection_params(
+        self,
+        line_merge_tolerance_px: float | None = None,
+        hough_strong_ratio: float | None = None,
+        hough_weak_ratio: float | None = None,
+        line_merge_method: str | None = None,
+        pitch_cv_max: float | None = None,
+        line_extend_fraction: float | None = None,
+    ) -> None:
+        """Update one or more grid-detector knobs. Each value is clamped to a
+        safe range so a malformed UI message can't crash Hough or starve the
+        line set to nothing. Only fields explicitly passed in are applied."""
+        if line_merge_tolerance_px is not None:
+            self._line_merge_tolerance_px = float(
+                max(0.0, min(50.0, line_merge_tolerance_px))
+            )
+        if hough_strong_ratio is not None:
+            self._hough_strong_ratio = float(
+                max(0.05, min(0.8, hough_strong_ratio))
+            )
+        if hough_weak_ratio is not None:
+            self._hough_weak_ratio = float(
+                max(0.02, min(0.5, hough_weak_ratio))
+            )
+        if line_merge_method is not None and line_merge_method in MERGE_METHODS:
+            self._line_merge_method = line_merge_method
+        if pitch_cv_max is not None:
+            # Clamp away from zero so the confidence-score division (1 - cv /
+            # threshold) stays well-defined even at the loosest setting.
+            self._pitch_cv_max = float(max(0.01, min(0.5, pitch_cv_max)))
+        if line_extend_fraction is not None:
+            self._line_extend_fraction = float(
+                max(0.0, min(1.0, line_extend_fraction))
+            )
+
+    def _grid_detection_params(self) -> GridDetectionParams:
+        return GridDetectionParams(
+            line_merge_tolerance_px=self._line_merge_tolerance_px,
+            hough_strong_ratio=self._hough_strong_ratio,
+            hough_weak_ratio=self._hough_weak_ratio,
+            line_merge_method=self._line_merge_method,
+            pitch_cv_max=self._pitch_cv_max,
+            line_extend_fraction=self._line_extend_fraction,
+        )
+
     async def start_calibration(self, method: CalibrationMethod = "aruco") -> None:
         if self.projector_dims is None:
             log.warning("start_calibration called but no projector has registered yet")
@@ -687,7 +761,9 @@ class AppState:
                 dtype=np.float64,
             )
             try:
-                grid_capture = detect_mat_grid(frame, aruco_quad)
+                grid_capture = detect_mat_grid(
+                    frame, aruco_quad, self._grid_detection_params()
+                )
             except Exception as e:  # noqa: BLE001
                 log.warning("mat-grid detector raised: %s", e)
                 grid_capture = MatGridCapture.failure(f"detector error: {e}")
@@ -850,17 +926,26 @@ class AppState:
         # Color scheme matches the camera-preview SVG overlay legend (BGR
         # because OpenCV). Drawn back-to-front: weak (most numerous) first,
         # then strong, axes (which overpaint their strong-line counterparts),
-        # diagonals, finally intersection dots.
-        draw_lines(grid_capture.weak_lines_cam, (184, 163, 148), 1)        # slate gray
-        draw_lines(grid_capture.strong_lines_cam, (240, 232, 226), 1)      # near-white
-        draw_lines(grid_capture.axis_a_lines_cam, (238, 211, 34), 2)       # cyan
-        draw_lines(grid_capture.axis_b_lines_cam, (246, 130, 59), 2)       # blue
-        draw_lines(grid_capture.diagonal_lines_cam, (153, 72, 236), 2)     # pink
+        # diagonals, finally intersection dots. Each layer is gated by the
+        # current debug-layer set so the user can toggle layers from the
+        # legend in the UI.
+        layers = self._grid_debug_layers
+        if "weak" in layers:
+            draw_lines(grid_capture.weak_lines_cam, (184, 163, 148), 1)        # slate gray
+        if "strong" in layers:
+            draw_lines(grid_capture.strong_lines_cam, (240, 232, 226), 1)      # near-white
+        if "axis_x" in layers:
+            draw_lines(grid_capture.axis_a_lines_cam, (238, 211, 34), 2)       # cyan
+        if "axis_y" in layers:
+            draw_lines(grid_capture.axis_b_lines_cam, (246, 130, 59), 2)       # blue
+        if "diagonals" in layers:
+            draw_lines(grid_capture.diagonal_lines_cam, (153, 72, 236), 2)     # pink
 
-        intersections = project_points(grid_capture.intersections_cam)
-        if intersections is not None and intersections.size > 0:
-            for x, y in intersections.astype(np.int32):
-                cv2.circle(out, (int(x), int(y)), 4, (128, 222, 74), -1)  # green
+        if "intersections" in layers:
+            intersections = project_points(grid_capture.intersections_cam)
+            if intersections is not None and intersections.size > 0:
+                for x, y in intersections.astype(np.int32):
+                    cv2.circle(out, (int(x), int(y)), 4, (128, 222, 74), -1)  # green
 
         if (
             not keystone_active
@@ -871,6 +956,57 @@ class AppState:
             cv2.polylines(
                 out, [pts], isClosed=True, color=(255, 255, 0), thickness=2
             )  # cyan in BGR
+
+        # 1D scatter of axis lines drawn outside the image so the ticks don't
+        # cover any pixels the user is trying to inspect. We pad the canvas
+        # with a bottom gutter (axis-A ticks) and a right gutter (axis-B
+        # ticks) and draw the ticks there. Each tick marks the projected
+        # midpoint of one strong axis line — uneven spacing in the tick row
+        # is exactly the "irregular pitch" the CV check sees.
+        canvas_h, canvas_w = out.shape[:2]
+        gutter = max(20, min(canvas_h, canvas_w) // 24)
+        out = cv2.copyMakeBorder(
+            out,
+            top=0,
+            bottom=gutter,
+            left=0,
+            right=gutter,
+            borderType=cv2.BORDER_CONSTANT,
+            value=(20, 22, 26),  # var(--bg) ish, BGR
+        )
+        # Thin separator between image and gutter so the boundary is obvious.
+        cv2.line(out, (0, canvas_h), (canvas_w, canvas_h), (60, 64, 72), 1)
+        cv2.line(out, (canvas_w, 0), (canvas_w, canvas_h + gutter), (60, 64, 72), 1)
+
+        def draw_axis_ticks(lines: np.ndarray, color, edge: str) -> None:
+            if lines is None or lines.size == 0:
+                return
+            mids_cam = np.column_stack(
+                [
+                    0.5 * (lines[:, 0] + lines[:, 2]),
+                    0.5 * (lines[:, 1] + lines[:, 3]),
+                ]
+            )
+            mids = project_points(mids_cam)
+            if mids is None or mids.size == 0:
+                return
+            if edge == "bottom":
+                y0 = canvas_h + 2
+                y1 = canvas_h + gutter - 2
+                for x, _y in mids.astype(np.int32):
+                    cx = int(np.clip(x, 0, canvas_w - 1))
+                    cv2.line(out, (cx, y0), (cx, y1), color, 2, cv2.LINE_AA)
+            elif edge == "right":
+                x0 = canvas_w + 2
+                x1 = canvas_w + gutter - 2
+                for _x, y in mids.astype(np.int32):
+                    cy = int(np.clip(y, 0, canvas_h - 1))
+                    cv2.line(out, (x0, cy), (x1, cy), color, 2, cv2.LINE_AA)
+
+        if "axis_x" in layers:
+            draw_axis_ticks(grid_capture.axis_a_lines_cam, (238, 211, 34), "bottom")  # cyan
+        if "axis_y" in layers:
+            draw_axis_ticks(grid_capture.axis_b_lines_cam, (246, 130, 59), "right")   # blue
 
         ok, enc = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 70])
         if ok:
@@ -899,15 +1035,16 @@ class AppState:
             homography so the rest of the pipeline (overlays, calibration)
             keeps working in original camera coordinates.
         """
+        params = self._grid_detection_params()
         if roi_quad is None or roi_quad.shape != (4, 2):
-            return detect_mat_grid(frame, roi_quad)
+            return detect_mat_grid(frame, roi_quad, params)
 
         # Keystone correction is only worthwhile when the manual polygon is
         # set — auto-derived quads are already axis-aligned rectangles and
         # don't benefit. We detect "manual polygon" by checking whether the
         # current camera_roi exists.
         if self.camera_roi is None:
-            return detect_mat_grid(frame, roi_quad)
+            return detect_mat_grid(frame, roi_quad, params)
 
         tl, tr, br, bl = roi_quad[0], roi_quad[1], roi_quad[2], roi_quad[3]
         top_w = float(np.linalg.norm(tr - tl))
@@ -917,7 +1054,7 @@ class AppState:
         out_w = int(round((top_w + bot_w) / 2.0))
         out_h = int(round((left_h + right_h) / 2.0))
         if out_w < 50 or out_h < 50:
-            return detect_mat_grid(frame, roi_quad)
+            return detect_mat_grid(frame, roi_quad, params)
 
         target = np.array(
             [[0, 0], [out_w, 0], [out_w, out_h], [0, out_h]], dtype=np.float32
@@ -933,9 +1070,9 @@ class AppState:
                 borderValue=(0, 0, 0),
             )
         except cv2.error:
-            return detect_mat_grid(frame, roi_quad)
+            return detect_mat_grid(frame, roi_quad, params)
 
-        capture = detect_mat_grid(warped, None)
+        capture = detect_mat_grid(warped, None, params)
         # Tell downstream consumers (debug preview overlay) that this
         # capture's preview canvas is the warped frame, not original cam_px.
         # The matrix forward-projects cam_px → preview_px so line/
@@ -1222,7 +1359,11 @@ class AppState:
                     self._detect_grid_pending = False
                     explicit_quad = self._compute_grid_roi_quad()
                     try:
-                        explicit_grid = detect_mat_grid(detect_frame, explicit_quad)
+                        explicit_grid = detect_mat_grid(
+                            detect_frame,
+                            explicit_quad,
+                            self._grid_detection_params(),
+                        )
                     except Exception as e:  # noqa: BLE001
                         log.warning("explicit mat-grid detection raised: %s", e)
                         explicit_grid = MatGridCapture.failure(f"detector error: {e}")
@@ -1621,6 +1762,17 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 await state.set_camera_roi(
                     msg.get("corners", []),
                     bool(msg.get("clear", False)),
+                )
+            elif mtype == "set_grid_debug_layers":
+                state.set_grid_debug_layers(list(msg.get("enabled", [])))
+            elif mtype == "set_grid_detection_params":
+                state.set_grid_detection_params(
+                    line_merge_tolerance_px=msg.get("line_merge_tolerance_px"),
+                    hough_strong_ratio=msg.get("hough_strong_ratio"),
+                    hough_weak_ratio=msg.get("hough_weak_ratio"),
+                    line_merge_method=msg.get("line_merge_method"),
+                    pitch_cv_max=msg.get("pitch_cv_max"),
+                    line_extend_fraction=msg.get("line_extend_fraction"),
                 )
             else:
                 log.warning("unknown command type: %s", mtype)

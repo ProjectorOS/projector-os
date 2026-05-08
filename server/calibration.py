@@ -356,6 +356,11 @@ class MatGridCapture:
     major_pitch_mm: float
     confidence: float
     reason: str | None = None
+    # Coefficient of variation of the per-axis major-line spacings. Surfaced
+    # so the UI can show "how irregular" a borderline pitch is without
+    # making the user re-eyeball the line scatter.
+    pitch_cv_x: float = 0.0
+    pitch_cv_y: float = 0.0
     # Diagnostic line sets in cam-pixel coordinates. weak ⊇ strong;
     # axis_a_lines_cam ∪ axis_b_lines_cam ∪ diagonal_lines_cam ⊆ strong_lines_cam.
     # `diagonal_lines_cam` is the set of strong lines that *aren't* aligned
@@ -398,6 +403,13 @@ def grid_capture_to_status(capture: MatGridCapture) -> MatGridStatus:
     axis_a = int(capture.axis_a_lines_cam.shape[0])
     axis_b = int(capture.axis_b_lines_cam.shape[0])
     diag = int(capture.diagonal_lines_cam.shape[0])
+    # Pitch + CV are populated even on most failure paths (see
+    # detect_mat_grid). Pass them through so the UI can show "we got this
+    # far in the pipeline" diagnostics.
+    pitch_x = capture.pitch_cam_px_x if capture.pitch_cam_px_x > 0 else None
+    pitch_y = capture.pitch_cam_px_y if capture.pitch_cam_px_y > 0 else None
+    cv_x = capture.pitch_cv_x if capture.pitch_cam_px_x > 0 else None
+    cv_y = capture.pitch_cv_y if capture.pitch_cam_px_y > 0 else None
     if capture.detected:
         return MatGridStatus(
             detected=True,
@@ -406,6 +418,8 @@ def grid_capture_to_status(capture: MatGridCapture) -> MatGridStatus:
             subdivisions_per_major=capture.subdivisions_per_major,
             pitch_cam_px_x=capture.pitch_cam_px_x,
             pitch_cam_px_y=capture.pitch_cam_px_y,
+            pitch_cv_x=capture.pitch_cv_x,
+            pitch_cv_y=capture.pitch_cv_y,
             intersection_count=int(capture.intersections_cam.shape[0]),
             confidence=capture.confidence,
             reason=None,
@@ -420,8 +434,10 @@ def grid_capture_to_status(capture: MatGridCapture) -> MatGridStatus:
         grid_system=None,
         major_pitch_mm=None,
         subdivisions_per_major=None,
-        pitch_cam_px_x=None,
-        pitch_cam_px_y=None,
+        pitch_cam_px_x=pitch_x,
+        pitch_cam_px_y=pitch_y,
+        pitch_cv_x=cv_x,
+        pitch_cv_y=cv_y,
         intersection_count=0,
         confidence=0.0,
         reason=capture.reason,
@@ -453,6 +469,180 @@ def _line_normal_distance(line: np.ndarray, axis_angle_rad: float) -> float:
     mx = 0.5 * (x1 + x2)
     my = 0.5 * (y1 + y2)
     return mx * nx + my * ny
+
+
+MERGE_METHODS: tuple[str, ...] = ("longest", "centroid", "median")
+
+
+def _cluster_representative(
+    cluster_lines: np.ndarray,
+    cluster_distances: np.ndarray,
+    axis_angle_rad: float,
+    method: str,
+) -> np.ndarray:
+    """Pick (or synthesize) one line to represent a cluster of near-duplicate
+    parallel lines. Strategies:
+
+    - `longest`: the longest member, returned unchanged. Visually anchored to
+      a real Hough detection; the representative will sit slightly off-center
+      between the cluster's edges if the longest member happens to be one
+      side's edge.
+    - `centroid`: shift the longest member perpendicular-to-axis so its
+      midpoint lands at the cluster's mean perpendicular distance. The
+      result sits exactly between the cluster's left/right edges, but the
+      endpoint geometry is synthesized rather than a literal Hough segment.
+    - `median`: the member whose perpendicular distance is closest to the
+      cluster median. Real Hough segment, more centered than `longest` when
+      the cluster has odd-count edges.
+    """
+    if len(cluster_lines) == 1:
+        return cluster_lines[0]
+    if method == "median":
+        median_d = float(np.median(cluster_distances))
+        idx = int(np.argmin(np.abs(cluster_distances - median_d)))
+        return cluster_lines[idx]
+    if method == "centroid":
+        lengths = np.linalg.norm(
+            cluster_lines[:, 2:4].astype(np.float64)
+            - cluster_lines[:, :2].astype(np.float64),
+            axis=1,
+        )
+        anchor = cluster_lines[int(np.argmax(lengths))].astype(np.float64).copy()
+        anchor_d = _line_normal_distance(anchor, axis_angle_rad)
+        mean_d = float(np.mean(cluster_distances))
+        nx = -math.sin(axis_angle_rad)
+        ny = math.cos(axis_angle_rad)
+        shift = mean_d - anchor_d
+        anchor[0] += nx * shift
+        anchor[1] += ny * shift
+        anchor[2] += nx * shift
+        anchor[3] += ny * shift
+        return anchor.astype(cluster_lines.dtype)
+    # "longest" (default fallback for unknown method names)
+    lengths = np.linalg.norm(
+        cluster_lines[:, 2:4].astype(np.float64)
+        - cluster_lines[:, :2].astype(np.float64),
+        axis=1,
+    )
+    return cluster_lines[int(np.argmax(lengths))]
+
+
+def _extend_lines_to_image(
+    lines: np.ndarray,
+    image_shape: tuple[int, int],
+    length_fraction_threshold: float,
+) -> np.ndarray:
+    """Extend any line whose length is at least `length_fraction_threshold`
+    of the smaller image dimension to the image boundary along its own
+    direction. Lines below the threshold are returned unchanged.
+
+    Extension is along each line's direction, not the axis angle, so the
+    line's perpendicular offset (and therefore the pitch computation) is
+    preserved exactly.
+    """
+    if (
+        lines is None
+        or len(lines) == 0
+        or length_fraction_threshold <= 0.0
+    ):
+        return lines
+    h, w = image_shape[:2]
+    min_dim = min(h, w)
+    if min_dim <= 0:
+        return lines
+    threshold_px = length_fraction_threshold * float(min_dim)
+    out = lines.astype(np.float64).copy()
+    for i in range(out.shape[0]):
+        x1, y1, x2, y2 = float(out[i, 0]), float(out[i, 1]), float(out[i, 2]), float(out[i, 3])
+        dx = x2 - x1
+        dy = y2 - y1
+        length = math.hypot(dx, dy)
+        if length < threshold_px or length <= 0:
+            continue
+        # Parametric line: (x1 + t*dx, y1 + t*dy). Find t at each image-edge
+        # intersection that lies within the image (small epsilon for
+        # numerical robustness), then keep the smallest and largest.
+        ts: list[float] = []
+        if dx != 0.0:
+            ts.append((0.0 - x1) / dx)
+            ts.append((float(w - 1) - x1) / dx)
+        if dy != 0.0:
+            ts.append((0.0 - y1) / dy)
+            ts.append((float(h - 1) - y1) / dy)
+        eps = 0.5
+        candidates: list[tuple[float, float, float]] = []
+        for t in ts:
+            cx = x1 + t * dx
+            cy = y1 + t * dy
+            if -eps <= cx <= (w - 1) + eps and -eps <= cy <= (h - 1) + eps:
+                candidates.append((t, cx, cy))
+        if len(candidates) < 2:
+            continue
+        candidates.sort(key=lambda c: c[0])
+        out[i, 0] = candidates[0][1]
+        out[i, 1] = candidates[0][2]
+        out[i, 2] = candidates[-1][1]
+        out[i, 3] = candidates[-1][2]
+    return out.astype(lines.dtype)
+
+
+def _cluster_lines_by_normal_distance(
+    lines: np.ndarray,
+    axis_angle_rad: float,
+    tolerance_px: float,
+    method: str = "longest",
+) -> np.ndarray:
+    """Merge near-duplicate parallel lines (e.g. the left and right edges of
+    one thick mat grid line) into a single representative.
+
+    Cluster membership: sort by perpendicular distance, walk left-to-right;
+    a line whose distance is within `tolerance_px` of the running cluster
+    centroid joins, otherwise close the cluster and start a new one.
+
+    Each cluster is reduced to one line via `_cluster_representative` using
+    the requested `method`. `tolerance_px <= 0` is a no-op (clustering
+    disabled).
+    """
+    if lines is None or len(lines) == 0 or tolerance_px <= 0.0:
+        return lines
+    distances = np.array(
+        [_line_normal_distance(l, axis_angle_rad) for l in lines],
+        dtype=np.float64,
+    )
+    order = np.argsort(distances)
+    sorted_lines = lines[order]
+    sorted_d = distances[order]
+
+    reps: list[np.ndarray] = []
+    cluster_start = 0
+    cluster_sum = float(sorted_d[0])
+    cluster_n = 1
+    for i in range(1, len(sorted_lines)):
+        centroid = cluster_sum / cluster_n
+        if abs(float(sorted_d[i]) - centroid) <= tolerance_px:
+            cluster_sum += float(sorted_d[i])
+            cluster_n += 1
+        else:
+            reps.append(
+                _cluster_representative(
+                    sorted_lines[cluster_start:i],
+                    sorted_d[cluster_start:i],
+                    axis_angle_rad,
+                    method,
+                )
+            )
+            cluster_start = i
+            cluster_sum = float(sorted_d[i])
+            cluster_n = 1
+    reps.append(
+        _cluster_representative(
+            sorted_lines[cluster_start:],
+            sorted_d[cluster_start:],
+            axis_angle_rad,
+            method,
+        )
+    )
+    return np.asarray(reps, dtype=lines.dtype)
 
 
 def _angle_diff_rad(a: float, b: float) -> float:
@@ -654,8 +844,42 @@ def _classify_grid_system(n_x: int, n_y: int) -> tuple[str, float, int] | None:
     return None
 
 
+@dataclass
+class GridDetectionParams:
+    """Runtime-tunable knobs for the grid detector. Defaults match the
+    historical hardcoded values so omitting `params` is behavior-preserving.
+
+    `line_merge_tolerance_px` controls post-Hough clustering of near-duplicate
+    parallel lines (the left+right edges of a thick mat line). Set to 0 to
+    disable.
+
+    `hough_strong_ratio` / `hough_weak_ratio` are multiplied by the ROI's
+    smaller dimension to derive the absolute Hough vote threshold and minimum
+    line length. Lower → more lines admitted.
+    """
+
+    line_merge_tolerance_px: float = 6.0
+    hough_strong_ratio: float = 0.4
+    hough_weak_ratio: float = 0.15
+    # Which strategy `_cluster_representative` uses to pick / synthesize a
+    # single line from each cluster. One of MERGE_METHODS; unknown names
+    # fall back to "longest" inside the helper.
+    line_merge_method: str = "longest"
+    # Max coefficient of variation on major-line spacings before the detector
+    # gives up with "pitch too irregular". Default mirrors the historical
+    # MAT_GRID_PITCH_CV_MAX = 0.10. Higher = more permissive.
+    pitch_cv_max: float = 0.10
+    # If a per-axis line's length is at least this fraction of the smaller
+    # image dimension, extend its endpoints along the line's direction to the
+    # image boundary. Cleans up displays where Hough returned a fragment of
+    # what is clearly a full-frame mat line. Set to 0 to disable.
+    line_extend_fraction: float = 0.20
+
+
 def detect_mat_grid(
-    frame: np.ndarray, roi_quad_cam: np.ndarray | None = None
+    frame: np.ndarray,
+    roi_quad_cam: np.ndarray | None = None,
+    params: GridDetectionParams | None = None,
 ) -> MatGridCapture:
     """Detect a printed cutting-mat grid in the camera frame.
 
@@ -674,6 +898,9 @@ def detect_mat_grid(
     if frame is None or frame.size == 0:
         return MatGridCapture.failure("empty frame")
 
+    if params is None:
+        params = GridDetectionParams()
+
     pre = preprocess_for_grid_detection(frame, roi_quad_cam)
     if pre is None:
         cap = MatGridCapture.failure("work-surface quad too small to crop")
@@ -686,20 +913,23 @@ def detect_mat_grid(
         return MatGridCapture.failure("ROI too small for line detection")
 
     # Two thresholds: strong = major lines (bold cm/inch), weak = all lines.
+    # Hough vote threshold + minLineLength both scale with the user-tunable
+    # ratios; weak's minLineLength uses 0.25 * its ratio so it stays shorter
+    # than its vote threshold (matches the historic 0.1 vs 0.15 ratio).
     strong_segments = cv2.HoughLinesP(
         edges,
         rho=1,
         theta=np.pi / 360.0,
-        threshold=int(min_dim * 0.4),
-        minLineLength=int(min_dim * 0.4),
+        threshold=int(min_dim * params.hough_strong_ratio),
+        minLineLength=int(min_dim * params.hough_strong_ratio),
         maxLineGap=int(min_dim * 0.05),
     )
     weak_segments = cv2.HoughLinesP(
         edges,
         rho=1,
         theta=np.pi / 360.0,
-        threshold=int(min_dim * 0.15),
-        minLineLength=int(min_dim * 0.1),
+        threshold=int(min_dim * params.hough_weak_ratio),
+        minLineLength=int(min_dim * params.hough_weak_ratio * (0.1 / 0.15)),
         maxLineGap=int(min_dim * 0.05),
     )
     # Hough returns None when *no* lines were found in that pass; we coerce to
@@ -749,6 +979,24 @@ def detect_mat_grid(
     strong_b = _lines_for_axis(strong, angle_b, tolerance_rad=MAT_GRID_LINE_AXIS_TOLERANCE_RAD)
     weak_a = _lines_for_axis(weak, angle_a, tolerance_rad=MAT_GRID_LINE_AXIS_TOLERANCE_RAD)
     weak_b = _lines_for_axis(weak, angle_b, tolerance_rad=MAT_GRID_LINE_AXIS_TOLERANCE_RAD)
+    # Collapse near-duplicate parallel lines (left+right edges of one thick
+    # mat line) so pitch detection and the displayed axis layers see one line
+    # per physical mat line. Skipped when tolerance is 0.
+    merge_tol = params.line_merge_tolerance_px
+    merge_method = params.line_merge_method
+    strong_a = _cluster_lines_by_normal_distance(strong_a, angle_a, merge_tol, merge_method)
+    strong_b = _cluster_lines_by_normal_distance(strong_b, angle_b, merge_tol, merge_method)
+    weak_a = _cluster_lines_by_normal_distance(weak_a, angle_a, merge_tol, merge_method)
+    weak_b = _cluster_lines_by_normal_distance(weak_b, angle_b, merge_tol, merge_method)
+    # Extend long fragments to image edges. Done after clustering so we
+    # extend the cluster's representative rather than every duplicate edge.
+    # Direction-only extension keeps pitch / intersections unchanged.
+    extend_frac = params.line_extend_fraction
+    img_shape = (frame.shape[0], frame.shape[1])
+    strong_a = _extend_lines_to_image(strong_a, img_shape, extend_frac)
+    strong_b = _extend_lines_to_image(strong_b, img_shape, extend_frac)
+    weak_a = _extend_lines_to_image(weak_a, img_shape, extend_frac)
+    weak_b = _extend_lines_to_image(weak_b, img_shape, extend_frac)
     out.axis_a_lines_cam = strong_a
     out.axis_b_lines_cam = strong_b
     out.diagonal_lines_cam = _lines_off_axes(
@@ -769,14 +1017,21 @@ def detect_mat_grid(
 
     pitch_a, cv_a = _modal_pitch(d_strong_a.tolist())
     pitch_b, cv_b = _modal_pitch(d_strong_b.tolist())
+    # Set pitch + CV before the regularity check so the UI can render the
+    # actual values on the irregularity-failure path (where we early-return).
+    out.pitch_cam_px_x = pitch_a
+    out.pitch_cam_px_y = pitch_b
+    out.pitch_cv_x = cv_a
+    out.pitch_cv_y = cv_b
     if pitch_a <= 0 or pitch_b <= 0:
         out.reason = "major-line pitch undetermined"
         return out
-    if cv_a > MAT_GRID_PITCH_CV_MAX or cv_b > MAT_GRID_PITCH_CV_MAX:
-        out.reason = "major-line pitch too irregular"
+    if cv_a > params.pitch_cv_max or cv_b > params.pitch_cv_max:
+        out.reason = (
+            f"major-line pitch too irregular "
+            f"(cv_x={cv_a:.2f}, cv_y={cv_b:.2f}; threshold {params.pitch_cv_max:.2f})"
+        )
         return out
-    out.pitch_cam_px_x = pitch_a
-    out.pitch_cam_px_y = pitch_b
 
     # Tolerance for "is this minor line the same as that major line" = 25 % of
     # the major pitch. Within that band we treat a weak detection as a duplicate
@@ -810,12 +1065,15 @@ def detect_mat_grid(
             angle_a, angle_b = angle_b, angle_a
             strong_a, strong_b = strong_b, strong_a
             pitch_a, pitch_b = pitch_b, pitch_a
+            cv_a, cv_b = cv_b, cv_a
             out.axis_x_angle_rad = angle_a
             out.axis_y_angle_rad = angle_b
             out.axis_a_lines_cam = strong_a
             out.axis_b_lines_cam = strong_b
             out.pitch_cam_px_x = pitch_a
             out.pitch_cam_px_y = pitch_b
+            out.pitch_cv_x = cv_a
+            out.pitch_cv_y = cv_b
 
     # Compute intersections of major lines (axis-A × axis-B) and keep only
     # those inside the work-surface quad's bounding box.
@@ -844,7 +1102,7 @@ def detect_mat_grid(
     # Confidence: combine line counts (more = better), pitch CVs (lower =
     # better), and the strict (n_x == n_y) check that we already passed.
     line_score = min(1.0, (len(strong_a) + len(strong_b)) / 16.0)
-    pitch_score = max(0.0, 1.0 - max(cv_a, cv_b) / MAT_GRID_PITCH_CV_MAX)
+    pitch_score = max(0.0, 1.0 - max(cv_a, cv_b) / params.pitch_cv_max)
     subdivision_score = 1.0
     confidence = float(0.5 * line_score + 0.3 * pitch_score + 0.2 * subdivision_score)
 

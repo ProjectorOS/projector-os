@@ -422,6 +422,12 @@ button.link-btn:hover {
   flex: 1 1 280px;
   min-width: 0;
 }
+/* Override the global `.calib-preview img { max-height: 360px }` cap so the
+   grid-debug image renders at its natural size — the tick-mark scatter is
+   easier to read when the image isn't shrunk. */
+.grid-debug-row .calib-preview img {
+  max-height: none;
+}
 .grid-debug-legend {
   flex: 0 0 auto;
   align-self: stretch;
@@ -451,6 +457,76 @@ button.link-btn:hover {
   align-items: baseline;
   justify-content: space-between;
   gap: 10px;
+}
+.grid-debug-legend .legend-row-toggle {
+  cursor: pointer;
+  user-select: none;
+  border-radius: 4px;
+  padding: 2px 4px;
+  margin: -2px -4px;
+}
+.grid-debug-legend .legend-row-toggle:hover {
+  background: var(--button-hover);
+}
+/* Dimmed state: layer is hidden in the debug image. We strike through the
+   label so the off-state reads at a glance even when the row is faint. */
+.grid-debug-legend .legend-row-off {
+  opacity: 0.4;
+}
+.grid-debug-legend .legend-row-off .legend-label {
+  text-decoration: line-through;
+}
+
+/* Tuning rows live inside the same legend box, below the pitch-regularity
+   block. Each row stacks its label on top of a slider + number input + reset
+   button. The number input overrides the global 110 px width so it fits
+   alongside the slider without forcing the legend column wider. */
+.grid-debug-legend .legend-tuning-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 4px;
+}
+.grid-debug-legend .legend-tuning-row label {
+  color: var(--muted);
+  font-size: 11px;
+}
+.grid-debug-legend .legend-tuning-controls {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.grid-debug-legend .legend-tuning-controls input[type="range"] {
+  flex: 1;
+  min-width: 0;
+}
+.grid-debug-legend .legend-tuning-controls input[type="number"] {
+  width: 56px;
+  font-size: 11px;
+  padding: 2px 4px;
+}
+.grid-debug-legend .legend-tuning-controls .link-btn {
+  padding: 0 2px;
+  font-size: 14px;
+  line-height: 1;
+}
+/* Radio group inside a tuning row. Wraps when the column is narrow so the
+   reset button still fits on the same row. */
+.grid-debug-legend .legend-tuning-radios {
+  flex-wrap: wrap;
+  row-gap: 2px;
+}
+.grid-debug-legend .legend-tuning-radio {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 11px;
+}
+.grid-debug-legend .legend-tuning-radio input[type="radio"] {
+  margin: 0;
+  accent-color: var(--accent);
 }
 .grid-debug-legend .legend-label {
   color: var(--fg);

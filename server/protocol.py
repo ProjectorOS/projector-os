@@ -146,6 +146,11 @@ class MatGridStatus(BaseModel):
     subdivisions_per_major: int | None = None  # 10, 5, 2, 4, 8, or 16
     pitch_cam_px_x: float | None = None
     pitch_cam_px_y: float | None = None
+    # Coefficient of variation of the per-axis major-line spacings (std / mean
+    # of consecutive line distances). Surfaced so the UI can show how
+    # close to / far over the regularity threshold a given frame is.
+    pitch_cv_x: float | None = None
+    pitch_cv_y: float | None = None
     intersection_count: int = 0
     confidence: float = 0.0
     reason: str | None = None  # populated when detected = False
@@ -359,6 +364,40 @@ class SetCameraRoiCommand(BaseModel):
     clear: bool = False
 
 
+class SetGridDebugLayersCommand(BaseModel):
+    """Toggle which detection-pipeline layers are painted into the grid-debug
+    preview JPEG. Layer names: weak, strong, axis_x, axis_y, diagonals,
+    intersections. Unknown names are ignored. Layers absent from `enabled`
+    are hidden from the next frame onward.
+    """
+
+    type: Literal["set_grid_debug_layers"] = "set_grid_debug_layers"
+    enabled: list[str] = Field(default_factory=list)
+
+
+class SetGridDetectionParamsCommand(BaseModel):
+    """Update one or more live-tunable grid detector knobs. Each field is
+    optional; omitted fields keep their server-side value. The server clamps
+    each to a safe range before applying.
+    """
+
+    type: Literal["set_grid_detection_params"] = "set_grid_detection_params"
+    line_merge_tolerance_px: float | None = None
+    hough_strong_ratio: float | None = None
+    hough_weak_ratio: float | None = None
+    # Strategy for picking a representative line per cluster: "longest",
+    # "centroid", or "median". Server falls back to "longest" silently for
+    # unknown values.
+    line_merge_method: str | None = None
+    # Max coefficient of variation on major-line spacings before the detector
+    # rejects a frame as "too irregular". Higher = more permissive.
+    pitch_cv_max: float | None = None
+    # Length-fraction threshold (relative to image min dim) above which a
+    # detected line is extended to the image boundary along its direction.
+    # 0 disables extension.
+    line_extend_fraction: float | None = None
+
+
 ClientCommand = Union[
     SetModeCommand,
     RegisterProjectorCommand,
@@ -368,4 +407,6 @@ ClientCommand = Union[
     SetWorkSurfaceCommand,
     SetCameraCommand,
     SetCameraRoiCommand,
+    SetGridDebugLayersCommand,
+    SetGridDetectionParamsCommand,
 ]

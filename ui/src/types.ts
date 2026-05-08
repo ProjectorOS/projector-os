@@ -58,6 +58,11 @@ export interface MatGridStatus {
   subdivisions_per_major: number | null; // 10, 5, 2, 4, 8, or 16
   pitch_cam_px_x: number | null;
   pitch_cam_px_y: number | null;
+  // Coefficient of variation of major-line spacings per axis (std / mean).
+  // Lets the UI show how close to / far over the regularity threshold a
+  // given frame is.
+  pitch_cv_x: number | null;
+  pitch_cv_y: number | null;
   intersection_count: number;
   confidence: number;
   reason: string | null; // populated when detected=false
@@ -158,4 +163,28 @@ export type ClientCommand =
       type: "set_camera_roi";
       corners: [number, number][];
       clear?: boolean;
+    }
+  | {
+      type: "set_grid_debug_layers";
+      // Subset of the closed layer set: weak, strong, axis_x, axis_y,
+      // diagonals, intersections. Layers omitted from this list are hidden
+      // from the grid-debug preview.
+      enabled: string[];
+    }
+  | {
+      type: "set_grid_detection_params";
+      // Each field is optional; omitted fields keep their current
+      // server-side value. Server clamps to safe ranges.
+      line_merge_tolerance_px?: number;
+      hough_strong_ratio?: number; // 0–1, multiplied by ROI min_dim
+      hough_weak_ratio?: number;
+      // "longest" | "centroid" | "median" — strategy for picking a
+      // representative line from each cluster.
+      line_merge_method?: string;
+      // Max coefficient of variation on major-line spacings before the
+      // detector rejects a frame. Higher = more permissive.
+      pitch_cv_max?: number;
+      // Length-fraction threshold (relative to image min dim) above which a
+      // detected line is extended to the image boundary. 0 disables.
+      line_extend_fraction?: number;
     };

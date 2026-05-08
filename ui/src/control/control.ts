@@ -136,6 +136,10 @@ const SERVER_HTTP = defaultServerHttpUrl();
 const SVG_NS = "http://www.w3.org/2000/svg";
 const PREVIEW_W = 320;
 const HANDLE_THICKNESS = 10;
+// Mirror of MAT_GRID_PITCH_CV_MAX in server/calibration.py — the threshold
+// above which "major-line pitch too irregular" fires. Kept here so the
+// debug-legend can color the offending row red.
+const MAT_GRID_PITCH_CV_MAX = 0.10;
 
 type Edge = "top" | "bottom" | "left" | "right";
 
@@ -200,6 +204,16 @@ class ControlApp {
   // calibration without forcing a render.
   private pendingMm = "";
   // UI prefs persisted to localStorage (per browser).
+  // Which grid-debug layers are currently visible. Defaults to all on; user
+  // toggles via legend row clicks. The set is also pushed to the server on
+  // every change so the MJPEG renderer skips disabled layers.
+  private gridDebugLayers: Set<GridDebugLayer> = readGridDebugLayers();
+  private gridDebugLayersPushed = false;
+  // Live-tunable detector knobs (sliders below the legend). Same lifecycle
+  // as gridDebugLayers — read on construction, pushed on hello, persisted
+  // on every change.
+  private gridDetectionParams: GridDetectionParams = readGridDetectionParams();
+  private gridDetectionParamsPushed = false;
   private workSurfaceCollapsed = readBool("workSurfaceCollapsed", false);
   private previewRotation: 0 | 180 = readNumber("previewRotation", 0) === 180 ? 180 : 0;
   // When true, the camera card hides the preview, heartbeat, and frame-stats line.
@@ -410,6 +424,12 @@ class ControlApp {
           this.pendingMm = formatMmForInput(ev.calibration.mat_width_mm);
           q<HTMLInputElement>("measurement-input").value = this.pendingMm;
         }
+        // Sync the server with our persisted layer prefs on first hello.
+        // The server defaults to all-on; without this push, a user who
+        // toggled "weak" off in a previous session would see weak lines
+        // again until they toggled twice.
+        if (!this.gridDebugLayersPushed) this.pushGridDebugLayers();
+        if (!this.gridDetectionParamsPushed) this.pushGridDetectionParams();
         this.applyAll();
         return;
       case "mode_changed":
@@ -1960,28 +1980,40 @@ class ControlApp {
     // Color → pipeline-stage → count legend, rendered in the sidebar to the
     // left of the grid-debug preview. Counts come from the continuous
     // detector status (mat_grid in calibration_captured) so the legend stays
-    // live during grid-method calibration. The intersection count uses the
-    // same green/amber convention as the camera-preview overlay dots.
+    // live during grid-method calibration. Each row is clickable: clicking
+    // toggles whether that layer is painted into the debug-preview JPEG
+    // (server-side, gated by the SetGridDebugLayersCommand).
+    // The intersection count uses the same green/amber convention as the
+    // camera-preview overlay dots.
     const el = q("grid-debug-legend");
     el.replaceChildren();
     const grid = this.state.matGrid;
     const intersections = grid?.intersection_count ?? 0;
     const detected = !!grid?.detected;
-    const items: [string, string, number | null][] = [
-      ["#94a3b8", "weak", grid?.weak_line_count ?? null],
-      ["#e2e8f0", "strong", grid?.strong_line_count ?? null],
-      ["#22d3ee", "axis X", grid?.axis_a_line_count ?? null],
-      ["#3b82f6", "axis Y", grid?.axis_b_line_count ?? null],
-      ["#ec4899", "diagonals", grid?.diagonal_line_count ?? null],
-      [detected ? "#4ade80" : "#fb923c", "intersections", grid ? intersections : null],
+    const items: [string, string, GridDebugLayer, number | null][] = [
+      ["#94a3b8", "weak", "weak", grid?.weak_line_count ?? null],
+      ["#e2e8f0", "strong", "strong", grid?.strong_line_count ?? null],
+      ["#22d3ee", "axis X", "axis_x", grid?.axis_a_line_count ?? null],
+      ["#3b82f6", "axis Y", "axis_y", grid?.axis_b_line_count ?? null],
+      ["#ec4899", "diagonals", "diagonals", grid?.diagonal_line_count ?? null],
+      [
+        detected ? "#4ade80" : "#fb923c",
+        "intersections",
+        "intersections",
+        grid ? intersections : null,
+      ],
     ];
     const title = document.createElement("div");
     title.className = "legend-title";
     title.textContent = "Edge detection";
     el.appendChild(title);
-    for (const [color, label, count] of items) {
+    for (const [color, label, layerKey, count] of items) {
       const row = document.createElement("div");
-      row.className = "legend-row";
+      row.className = "legend-row legend-row-toggle";
+      const enabled = this.gridDebugLayers.has(layerKey);
+      if (!enabled) row.classList.add("legend-row-off");
+      row.title = enabled ? `Hide ${label}` : `Show ${label}`;
+      row.addEventListener("click", () => this.toggleGridDebugLayer(layerKey));
       const lbl = document.createElement("span");
       lbl.className = "legend-label";
       lbl.style.color = color;
@@ -1992,6 +2024,306 @@ class ControlApp {
       row.append(lbl, cnt);
       el.appendChild(row);
     }
+
+    // Pitch + CV per axis. CV > MAT_GRID_PITCH_CV_MAX (kept in sync with the
+    // server constant) is the trigger for the "major-line pitch too irregular"
+    // failure — render the offending row in red so the user can see at a
+    // glance which axis is the problem.
+    const pitchTitle = document.createElement("div");
+    pitchTitle.className = "legend-title";
+    pitchTitle.style.marginTop = "6px";
+    pitchTitle.textContent = "Pitch regularity";
+    el.appendChild(pitchTitle);
+    const pitchRows: [string, number | null, number | null][] = [
+      ["pitch X", grid?.pitch_cam_px_x ?? null, grid?.pitch_cv_x ?? null],
+      ["pitch Y", grid?.pitch_cam_px_y ?? null, grid?.pitch_cv_y ?? null],
+    ];
+    for (const [label, pitch, cv] of pitchRows) {
+      const row = document.createElement("div");
+      row.className = "legend-row";
+      const lbl = document.createElement("span");
+      lbl.className = "legend-label";
+      lbl.textContent = label;
+      const val = document.createElement("span");
+      val.className = "legend-count";
+      if (pitch === null || cv === null) {
+        val.textContent = "—";
+      } else {
+        val.textContent = `${pitch.toFixed(1)} px (cv ${cv.toFixed(2)})`;
+        if (cv > MAT_GRID_PITCH_CV_MAX) {
+          val.style.color = "var(--error)";
+        }
+      }
+      row.append(lbl, val);
+      el.appendChild(row);
+    }
+
+    this.renderTuningControls(el);
+  }
+
+  private toggleGridDebugLayer(layer: GridDebugLayer): void {
+    if (this.gridDebugLayers.has(layer)) {
+      this.gridDebugLayers.delete(layer);
+    } else {
+      this.gridDebugLayers.add(layer);
+    }
+    writeGridDebugLayers(this.gridDebugLayers);
+    this.pushGridDebugLayers();
+    this.updateGridDebugLegend();
+  }
+
+  private pushGridDebugLayers(): void {
+    // Always-send: server stores in memory only (not persisted), so we keep
+    // its set in lockstep with the UI's persisted prefs.
+    this.ws.send({
+      type: "set_grid_debug_layers",
+      enabled: Array.from(this.gridDebugLayers),
+    });
+    this.gridDebugLayersPushed = true;
+  }
+
+  private pushGridDetectionParams(): void {
+    // Server clamps each value, so we send all six on every push and let
+    // the server enforce safe ranges.
+    this.ws.send({
+      type: "set_grid_detection_params",
+      line_merge_tolerance_px: this.gridDetectionParams.mergeTolerancePx,
+      hough_strong_ratio: this.gridDetectionParams.strongRatio,
+      hough_weak_ratio: this.gridDetectionParams.weakRatio,
+      line_merge_method: this.gridDetectionParams.mergeMethod,
+      pitch_cv_max: this.gridDetectionParams.pitchCvMax,
+      line_extend_fraction: this.gridDetectionParams.extendFraction,
+    });
+    this.gridDetectionParamsPushed = true;
+  }
+
+  private setGridDetectionParam<K extends keyof GridDetectionParams>(
+    key: K,
+    value: GridDetectionParams[K],
+  ): void {
+    // Don't trigger a full legend rebuild here — it would replace the input
+    // the user is actively dragging/typing into and steal focus. The slider
+    // + number-input mirroring is handled inline in renderTuningControls.
+    this.gridDetectionParams[key] = value;
+    writeGridDetectionParams(this.gridDetectionParams);
+    this.pushGridDetectionParams();
+  }
+
+  private renderTuningControls(parent: HTMLElement): void {
+    // Slider + paired number input + reset button per knob. Two-way bind:
+    // changing either input updates the other; the reset button writes the
+    // compiled-in default. UI shows percent for the Hough ratios so the
+    // sliders are human-readable; we convert at the WS boundary.
+    const title = document.createElement("div");
+    title.className = "legend-title";
+    title.style.marginTop = "8px";
+    title.textContent = "Tuning";
+    parent.appendChild(title);
+
+    // Numeric tuning rows only — the merge-method radio is rendered
+    // separately below this loop. Restricting `key` to the numeric fields
+    // keeps the slider/number generic from having to handle string params.
+    type NumericKey =
+      | "mergeTolerancePx"
+      | "strongRatio"
+      | "weakRatio"
+      | "pitchCvMax"
+      | "extendFraction";
+    interface Row {
+      label: string;
+      key: NumericKey;
+      sliderMin: number;
+      sliderMax: number;
+      numMin: number;
+      numMax: number;
+      step: number;
+      // Convert between stored param value and slider/number-displayed value
+      toUi: (v: number) => number;
+      fromUi: (v: number) => number;
+      defaultUi: number;
+      titleSuffix: string; // for the reset tooltip
+    }
+    const rows: Row[] = [
+      {
+        label: "Merge tolerance (px)",
+        key: "mergeTolerancePx",
+        sliderMin: 0,
+        sliderMax: 30,
+        numMin: 0,
+        numMax: 50,
+        step: 1,
+        toUi: (v) => v,
+        fromUi: (v) => v,
+        defaultUi: GRID_DETECTION_DEFAULTS.mergeTolerancePx,
+        titleSuffix: `${GRID_DETECTION_DEFAULTS.mergeTolerancePx}`,
+      },
+      {
+        label: "Hough strong (% of min dim)",
+        key: "strongRatio",
+        sliderMin: 5,
+        sliderMax: 60,
+        numMin: 5,
+        numMax: 80,
+        step: 1,
+        toUi: (v) => Math.round(v * 100),
+        fromUi: (v) => v / 100,
+        defaultUi: Math.round(GRID_DETECTION_DEFAULTS.strongRatio * 100),
+        titleSuffix: `${Math.round(GRID_DETECTION_DEFAULTS.strongRatio * 100)}`,
+      },
+      {
+        label: "Hough weak (% of min dim)",
+        key: "weakRatio",
+        sliderMin: 2,
+        sliderMax: 40,
+        numMin: 2,
+        numMax: 50,
+        step: 1,
+        toUi: (v) => Math.round(v * 100),
+        fromUi: (v) => v / 100,
+        defaultUi: Math.round(GRID_DETECTION_DEFAULTS.weakRatio * 100),
+        titleSuffix: `${Math.round(GRID_DETECTION_DEFAULTS.weakRatio * 100)}`,
+      },
+      {
+        // Threshold above which the detector reports "pitch too irregular".
+        // Shown in percent so the slider matches the cv values displayed in
+        // the legend (which are formatted to 2 decimals as 0.00–0.50).
+        label: "Pitch CV max (%)",
+        key: "pitchCvMax",
+        sliderMin: 1,
+        sliderMax: 30,
+        numMin: 1,
+        numMax: 50,
+        step: 1,
+        toUi: (v) => Math.round(v * 100),
+        fromUi: (v) => v / 100,
+        defaultUi: Math.round(GRID_DETECTION_DEFAULTS.pitchCvMax * 100),
+        titleSuffix: `${Math.round(GRID_DETECTION_DEFAULTS.pitchCvMax * 100)}`,
+      },
+      {
+        // Lines whose length is at least this fraction of the smaller image
+        // dimension are extended to the image boundary along their direction.
+        // 0 disables extension. Shown in percent.
+        label: "Extend if ≥ (% of min dim)",
+        key: "extendFraction",
+        sliderMin: 0,
+        sliderMax: 50,
+        numMin: 0,
+        numMax: 100,
+        step: 1,
+        toUi: (v) => Math.round(v * 100),
+        fromUi: (v) => v / 100,
+        defaultUi: Math.round(GRID_DETECTION_DEFAULTS.extendFraction * 100),
+        titleSuffix: `${Math.round(GRID_DETECTION_DEFAULTS.extendFraction * 100)}`,
+      },
+    ];
+
+    for (const r of rows) {
+      const row = document.createElement("div");
+      row.className = "legend-tuning-row";
+      const label = document.createElement("label");
+      label.textContent = r.label;
+      const controls = document.createElement("div");
+      controls.className = "legend-tuning-controls";
+      const slider = document.createElement("input");
+      slider.type = "range";
+      slider.min = String(r.sliderMin);
+      slider.max = String(r.sliderMax);
+      slider.step = String(r.step);
+      const num = document.createElement("input");
+      num.type = "number";
+      num.min = String(r.numMin);
+      num.max = String(r.numMax);
+      num.step = String(r.step);
+
+      const apply = (uiValue: number, source: "slider" | "num"): void => {
+        const stored = r.fromUi(uiValue);
+        // Mirror to the other input. Don't write back to `source` so the
+        // user can still edit a partial value (e.g. typing "0" before "1")
+        // without the cursor jumping mid-edit.
+        if (source !== "slider") slider.value = String(uiValue);
+        if (source !== "num") num.value = String(uiValue);
+        this.setGridDetectionParam(r.key, stored);
+      };
+
+      const initial = r.toUi(this.gridDetectionParams[r.key]);
+      slider.value = String(initial);
+      num.value = String(initial);
+
+      slider.addEventListener("input", () =>
+        apply(parseFloat(slider.value), "slider"),
+      );
+      num.addEventListener("input", () => {
+        const parsed = parseFloat(num.value);
+        if (!Number.isFinite(parsed)) return;
+        apply(parsed, "num");
+      });
+
+      const reset = document.createElement("button");
+      reset.type = "button";
+      reset.className = "link-btn";
+      reset.title = `Reset to default (${r.titleSuffix})`;
+      reset.textContent = "↺";
+      reset.addEventListener("click", () => apply(r.defaultUi, "num"));
+
+      controls.append(slider, num, reset);
+      row.append(label, controls);
+      parent.appendChild(row);
+    }
+
+    // Radio group: cluster-representative strategy. Same row layout as the
+    // sliders so it slots in cleanly. Uses native radio inputs grouped via a
+    // unique `name` so picking one auto-deselects the others.
+    const methodRow = document.createElement("div");
+    methodRow.className = "legend-tuning-row";
+    const methodLabel = document.createElement("label");
+    methodLabel.textContent = "Merge method";
+    const methodControls = document.createElement("div");
+    methodControls.className = "legend-tuning-controls legend-tuning-radios";
+    const groupName = `merge-method-${Math.random().toString(36).slice(2, 8)}`;
+    const methodHints: Record<MergeMethod, string> = {
+      longest:
+        "Pick the longest line in the cluster (real Hough segment, may sit slightly off-center).",
+      centroid:
+        "Synthesize a line at the cluster's mean perpendicular distance (perfectly centered between left/right edges).",
+      median:
+        "Pick the line whose distance is closest to the cluster median (real segment, more centered than 'longest').",
+    };
+    for (const method of MERGE_METHODS) {
+      const optLabel = document.createElement("label");
+      optLabel.className = "legend-tuning-radio";
+      optLabel.title = methodHints[method];
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = groupName;
+      radio.value = method;
+      radio.checked = this.gridDetectionParams.mergeMethod === method;
+      radio.addEventListener("change", () => {
+        if (radio.checked) {
+          this.setGridDetectionParam("mergeMethod", method);
+        }
+      });
+      const text = document.createElement("span");
+      text.textContent = method;
+      optLabel.append(radio, text);
+      methodControls.appendChild(optLabel);
+    }
+    const methodReset = document.createElement("button");
+    methodReset.type = "button";
+    methodReset.className = "link-btn";
+    methodReset.title = `Reset to default (${GRID_DETECTION_DEFAULTS.mergeMethod})`;
+    methodReset.textContent = "↺";
+    methodReset.addEventListener("click", () => {
+      this.setGridDetectionParam("mergeMethod", GRID_DETECTION_DEFAULTS.mergeMethod);
+      // Update the radio DOM in-place so we don't rebuild the whole legend.
+      for (const input of methodControls.querySelectorAll<HTMLInputElement>(
+        "input[type=radio]",
+      )) {
+        input.checked = input.value === GRID_DETECTION_DEFAULTS.mergeMethod;
+      }
+    });
+    methodControls.appendChild(methodReset);
+    methodRow.append(methodLabel, methodControls);
+    parent.appendChild(methodRow);
   }
 
   // ─── Misc actions ────────────────────────────────────────────────────────
@@ -2197,6 +2529,111 @@ function parseLengthMm(input: string): number | null {
       return value * 304.8;
     default:
       return null;
+  }
+}
+
+type GridDebugLayer =
+  | "weak"
+  | "strong"
+  | "axis_x"
+  | "axis_y"
+  | "diagonals"
+  | "intersections";
+
+const GRID_DEBUG_LAYERS_ALL: readonly GridDebugLayer[] = [
+  "weak",
+  "strong",
+  "axis_x",
+  "axis_y",
+  "diagonals",
+  "intersections",
+] as const;
+
+function readGridDebugLayers(): Set<GridDebugLayer> {
+  // Persisted as comma-joined names. Missing key → all on (initial UX).
+  try {
+    const raw = localStorage.getItem("projectoros.gridDebugLayers");
+    if (raw === null) return new Set(GRID_DEBUG_LAYERS_ALL);
+    const names = raw.split(",").filter(Boolean) as GridDebugLayer[];
+    return new Set(names.filter((n) => GRID_DEBUG_LAYERS_ALL.includes(n)));
+  } catch {
+    return new Set(GRID_DEBUG_LAYERS_ALL);
+  }
+}
+
+function writeGridDebugLayers(set: Set<GridDebugLayer>): void {
+  try {
+    localStorage.setItem(
+      "projectoros.gridDebugLayers",
+      Array.from(set).join(","),
+    );
+  } catch {
+    /* ignore */
+  }
+}
+
+type MergeMethod = "longest" | "centroid" | "median";
+const MERGE_METHODS: readonly MergeMethod[] = [
+  "longest",
+  "centroid",
+  "median",
+] as const;
+
+// Live-tunable grid-detector knobs. Defaults match the server-side defaults
+// in calibration.GridDetectionParams; the UI persists overrides per browser
+// in localStorage and re-pushes them on each WebSocket hello.
+interface GridDetectionParams {
+  mergeTolerancePx: number;
+  strongRatio: number; // 0–1, fraction of ROI min_dim
+  weakRatio: number;
+  mergeMethod: MergeMethod;
+  pitchCvMax: number; // 0–1, threshold above which "pitch too irregular" fires
+  // 0–1, length-fraction threshold above which a line is extended to the
+  // image boundary. 0 disables extension.
+  extendFraction: number;
+}
+const GRID_DETECTION_DEFAULTS: GridDetectionParams = {
+  mergeTolerancePx: 6,
+  strongRatio: 0.4,
+  weakRatio: 0.15,
+  mergeMethod: "longest",
+  pitchCvMax: 0.10,
+  extendFraction: 0.20,
+};
+
+function readGridDetectionParams(): GridDetectionParams {
+  const out = { ...GRID_DETECTION_DEFAULTS };
+  try {
+    const raw = localStorage.getItem("projectoros.gridDetectionParams");
+    if (raw === null) return out;
+    const parsed = JSON.parse(raw) as Partial<GridDetectionParams>;
+    if (typeof parsed.mergeTolerancePx === "number")
+      out.mergeTolerancePx = parsed.mergeTolerancePx;
+    if (typeof parsed.strongRatio === "number")
+      out.strongRatio = parsed.strongRatio;
+    if (typeof parsed.weakRatio === "number")
+      out.weakRatio = parsed.weakRatio;
+    if (
+      typeof parsed.mergeMethod === "string" &&
+      (MERGE_METHODS as readonly string[]).includes(parsed.mergeMethod)
+    ) {
+      out.mergeMethod = parsed.mergeMethod as MergeMethod;
+    }
+    if (typeof parsed.pitchCvMax === "number")
+      out.pitchCvMax = parsed.pitchCvMax;
+    if (typeof parsed.extendFraction === "number")
+      out.extendFraction = parsed.extendFraction;
+  } catch {
+    /* ignore */
+  }
+  return out;
+}
+
+function writeGridDetectionParams(p: GridDetectionParams): void {
+  try {
+    localStorage.setItem("projectoros.gridDetectionParams", JSON.stringify(p));
+  } catch {
+    /* ignore */
   }
 }
 
