@@ -349,6 +349,12 @@ button.link-btn:hover {
   margin: 10px 0 12px;
   height: 360px;
 }
+/* Author `display: flex` above wins over the user-agent `[hidden]
+   { display: none }` rule (same specificity, author > UA), so we need an
+   explicit override to actually collapse the row when previewHidden. */
+.cam-preview-row[hidden] {
+  display: none;
+}
 .cam-preview-row .calib-preview {
   flex: 1 1 280px;
   min-width: 0;

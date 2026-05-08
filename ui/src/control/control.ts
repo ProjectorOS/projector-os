@@ -730,6 +730,11 @@ class ControlApp {
 
     const camPreview = q("cam-preview");
     camPreview.hidden = this.previewHidden;
+    // The row wraps the preview + magnifier and has a fixed 360 px height
+    // (so the magnifier's `height: 100%` is anchored). Hide the row itself
+    // when the preview is closed so its 360 px box doesn't stay around as
+    // empty space inside the camera card.
+    q("cam-preview-row").hidden = this.previewHidden;
     q("heartbeat-row").hidden = this.previewHidden;
     q("camera-rotate-btn").hidden = this.previewHidden;
     q<HTMLButtonElement>("camera-preview-toggle-btn").textContent = this.previewHidden

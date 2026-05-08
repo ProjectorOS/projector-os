@@ -782,14 +782,19 @@ class AppState:
 
         Layout: full-frame green-suppressed grayscale on the outside, CLAHE'd
         ROI inside the work-surface bounding box, Canny edges painted in red
-        on top of the CLAHE'd region, and the ROI quad outlined in cyan.
-        Skipped (cache cleared) when there's no usable preprocessing yet.
+        on top of the CLAHE'd region, every detected grid line layer
+        (weak / strong / axis-X / axis-Y / diagonals) drawn in the same color
+        scheme as the camera-preview overlay, and intersections as green
+        dots. The ROI quad is outlined in cyan only when keystone correction
+        is NOT active — in keystone mode the warped frame *is* the ROI, and
+        the quad's original-cam-px coordinates would land off-frame on a
+        warped-sized canvas.
         """
         pre = grid_capture.preprocessing
         if pre is None or frame is None or frame.size == 0:
             self._last_grid_preview_jpeg = None
             return
-        h, w = frame.shape[:2]
+        ph, pw = pre.gray_full.shape[:2]
         out = cv2.cvtColor(pre.gray_full, cv2.COLOR_GRAY2BGR)
         # Dim the outside-ROI region so the user's eye is drawn to the area
         # the detector actually consumes.
@@ -799,8 +804,8 @@ class AppState:
         edges_roi = pre.edges_roi
         rh, rw = clahe_roi.shape[:2]
         ox, oy = int(pre.roi_origin[0]), int(pre.roi_origin[1])
-        rh = min(rh, h - oy)
-        rw = min(rw, w - ox)
+        rh = min(rh, ph - oy)
+        rw = min(rw, pw - ox)
         if rh > 0 and rw > 0:
             roi_bgr = cv2.cvtColor(clahe_roi[:rh, :rw], cv2.COLOR_GRAY2BGR)
             # Paint Canny edges bright red on top so the user can see exactly
@@ -810,7 +815,58 @@ class AppState:
             roi_bgr[edge_mask] = (60, 60, 255)  # BGR red
             out[oy : oy + rh, ox : ox + rw] = roi_bgr
 
-        if roi_quad is not None and roi_quad.shape == (4, 2):
+        # Forward-project every spatial output from cam_px into preview_px
+        # before drawing. In non-keystone mode `h_cam_to_preview` is None
+        # (preview *is* cam_px) and these are identity transforms.
+        h_to_preview = pre.h_cam_to_preview
+        keystone_active = h_to_preview is not None
+
+        def project_lines(arr: np.ndarray) -> np.ndarray:
+            if arr is None or arr.size == 0:
+                return arr
+            if h_to_preview is None:
+                return arr
+            n = arr.shape[0]
+            endpoints = arr.astype(np.float64).reshape(n * 2, 1, 2)
+            warped = cv2.perspectiveTransform(endpoints, h_to_preview)
+            return warped.reshape(n, 4)
+
+        def project_points(arr: np.ndarray) -> np.ndarray:
+            if arr is None or arr.size == 0:
+                return arr
+            if h_to_preview is None:
+                return arr
+            pts = arr.astype(np.float64).reshape(-1, 1, 2)
+            warped = cv2.perspectiveTransform(pts, h_to_preview)
+            return warped.reshape(arr.shape)
+
+        def draw_lines(arr: np.ndarray, color, thickness: int) -> None:
+            projected = project_lines(arr)
+            if projected is None or projected.size == 0:
+                return
+            for x1, y1, x2, y2 in projected.astype(np.int32):
+                cv2.line(out, (int(x1), int(y1)), (int(x2), int(y2)), color, thickness, cv2.LINE_AA)
+
+        # Color scheme matches the camera-preview SVG overlay legend (BGR
+        # because OpenCV). Drawn back-to-front: weak (most numerous) first,
+        # then strong, axes (which overpaint their strong-line counterparts),
+        # diagonals, finally intersection dots.
+        draw_lines(grid_capture.weak_lines_cam, (184, 163, 148), 1)        # slate gray
+        draw_lines(grid_capture.strong_lines_cam, (240, 232, 226), 1)      # near-white
+        draw_lines(grid_capture.axis_a_lines_cam, (238, 211, 34), 2)       # cyan
+        draw_lines(grid_capture.axis_b_lines_cam, (246, 130, 59), 2)       # blue
+        draw_lines(grid_capture.diagonal_lines_cam, (153, 72, 236), 2)     # pink
+
+        intersections = project_points(grid_capture.intersections_cam)
+        if intersections is not None and intersections.size > 0:
+            for x, y in intersections.astype(np.int32):
+                cv2.circle(out, (int(x), int(y)), 4, (128, 222, 74), -1)  # green
+
+        if (
+            not keystone_active
+            and roi_quad is not None
+            and roi_quad.shape == (4, 2)
+        ):
             pts = roi_quad.astype(np.int32).reshape(-1, 1, 2)
             cv2.polylines(
                 out, [pts], isClosed=True, color=(255, 255, 0), thickness=2
@@ -880,6 +936,13 @@ class AppState:
             return detect_mat_grid(frame, roi_quad)
 
         capture = detect_mat_grid(warped, None)
+        # Tell downstream consumers (debug preview overlay) that this
+        # capture's preview canvas is the warped frame, not original cam_px.
+        # The matrix forward-projects cam_px → preview_px so line/
+        # intersection arrays (which we'll transform back to cam_px below)
+        # can be re-projected into preview space when drawn.
+        if capture.preprocessing is not None:
+            capture.preprocessing.h_cam_to_preview = h_quad_to_rect.astype(np.float64)
 
         try:
             h_rect_to_cam = np.linalg.inv(h_quad_to_rect.astype(np.float64))

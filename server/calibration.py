@@ -255,6 +255,13 @@ class GridPreprocessing:
     clahe_roi: np.ndarray  # (h, w) uint8, CLAHE'd ROI used for edge detection
     edges_roi: np.ndarray  # (h, w) uint8, Canny edge map of the ROI
     roi_origin: np.ndarray  # (2,) float64, top-left of the ROI in cam_px
+    # Set by the keystone-correction path (`_run_grid_detection_with_keystone`)
+    # when the detector ran on a warped image instead of the original frame.
+    # Maps cam_px → preview_px so the debug overlay can forward-project lines
+    # and intersections (which are stored in original cam_px on the wire) onto
+    # the warped preview canvas. None means the preview canvas IS in cam_px
+    # — no transform needed.
+    h_cam_to_preview: np.ndarray | None = None
 
 
 def preprocess_for_grid_detection(
