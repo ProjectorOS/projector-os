@@ -61,6 +61,13 @@ export interface MatGridStatus {
   intersection_count: number;
   confidence: number;
   reason: string | null; // populated when detected=false
+  // Per-stage line counts from the detector — surfaced so the UI can render a
+  // count legend next to the debug preview without needing line geometry.
+  weak_line_count: number;
+  strong_line_count: number;
+  axis_a_line_count: number;
+  axis_b_line_count: number;
+  diagonal_line_count: number;
 }
 
 export type ServerEvent =

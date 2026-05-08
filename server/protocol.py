@@ -149,6 +149,14 @@ class MatGridStatus(BaseModel):
     intersection_count: int = 0
     confidence: float = 0.0
     reason: str | None = None  # populated when detected = False
+    # Per-stage line counts from the detection pipeline. Surfaced so the UI
+    # can render a count legend next to the debug preview without needing the
+    # full line geometry (which only the explicit-detection path carries).
+    weak_line_count: int = 0
+    strong_line_count: int = 0
+    axis_a_line_count: int = 0
+    axis_b_line_count: int = 0
+    diagonal_line_count: int = 0
 
 
 class MatGridDetectedEvent(BaseModel):

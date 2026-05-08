@@ -220,9 +220,14 @@
           <!-- "What OpenCV sees" preview: dim grayscale outside the ROI, CLAHE'd
                brightness inside the work-surface bounding box, Canny edges
                painted in red, ROI quad outlined in cyan. Visible only during
-               grid-method calibration. -->
-          <div class="calib-preview" data-role="grid-debug-preview" hidden>
-            <img data-role="grid-debug-preview-img" alt="Grid detector view" />
+               grid-method calibration. The legend on the left maps overlay
+               colors to pipeline stages so the user can read the debug
+               image at a glance. -->
+          <div class="grid-debug-row" data-role="grid-debug-row" hidden>
+            <div class="grid-debug-legend" data-role="grid-debug-legend"></div>
+            <div class="calib-preview" data-role="grid-debug-preview" hidden>
+              <img data-role="grid-debug-preview-img" alt="Grid detector view" />
+            </div>
           </div>
           <!-- Rectified preview: camera frame warped through H_cam_to_mat
                from grid detection so the cutting-mat grid appears straight

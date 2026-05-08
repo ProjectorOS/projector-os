@@ -1117,6 +1117,7 @@ class ControlApp {
 
     // Re-show ArUco-only UI in case we switched back from grid mode.
     q("grid-detect-block").hidden = false;
+    q("grid-debug-row").hidden = true;
     q("grid-debug-preview").hidden = true;
     q("grid-rectified-preview").hidden = true;
     q("camera-roi-controls").hidden = true;
@@ -1289,11 +1290,13 @@ class ControlApp {
     // redundant. Hide the whole block.
     q("grid-detect-block").hidden = true;
     // Show the "what OpenCV sees" preview and start the MJPEG stream.
+    q("grid-debug-row").hidden = false;
     q("grid-debug-preview").hidden = false;
     if (!this.gridPreviewActive) {
       q<HTMLImageElement>("grid-debug-preview-img").src = `${SERVER_HTTP}/camera/grid_preview.mjpg`;
       this.gridPreviewActive = true;
     }
+    this.updateGridDebugLegend();
     // And the keystone-corrected preview.
     q("grid-rectified-preview").hidden = false;
     if (!this.gridRectifiedPreviewActive) {
@@ -1367,29 +1370,8 @@ class ControlApp {
       detail.textContent = "";
     }
     resultRow.appendChild(detail);
-
-    // Legend mapping camera-preview overlay colors to pipeline stages so the
-    // user can read "axes not separable" + a screenful of gray lines as
-    // "Hough found edges but they didn't cluster into two perpendicular sets".
-    const legend = document.createElement("div");
-    legend.className = "help";
-    legend.style.marginTop = "4px";
-    const legendItems: [string, string, number][] = [
-      ["#94a3b8", "━ weak", result.weakLinesCam.length],
-      ["#e2e8f0", "━ strong", result.strongLinesCam.length],
-      ["#22d3ee", "━ axis X", result.axisALinesCam.length],
-      ["#3b82f6", "━ axis Y", result.axisBLinesCam.length],
-      ["#ec4899", "━ diagonals", result.diagonalLinesCam.length],
-      ["#4ade80", "● intersection", result.intersectionsCam.length],
-    ];
-    legendItems.forEach(([color, text, count], i) => {
-      if (i > 0) legend.append(" · ");
-      const swatch = document.createElement("span");
-      swatch.style.color = color;
-      swatch.textContent = `${text} (${count})`;
-      legend.append(swatch);
-    });
-    resultRow.appendChild(legend);
+    // Per-stage line counts are surfaced in the legend next to the grid-debug
+    // preview (updateGridDebugLegend) — no need to duplicate them here.
   }
 
   private applyDetections(): void {
@@ -1967,38 +1949,49 @@ class ControlApp {
       }
     }
 
-    // Stage counts in the top-left corner so the user can tell at a glance
-    // which pipeline step gave up — even when a stage produced 0 segments
-    // (in which case there's nothing to draw for that color).
-    const counts = [
-      ["weak", result.weakLinesCam.length, "#94a3b8"],
-      ["strong", result.strongLinesCam.length, "#e2e8f0"],
-      ["axis X", result.axisALinesCam.length, "#22d3ee"],
-      ["axis Y", result.axisBLinesCam.length, "#3b82f6"],
-      ["diagonals", result.diagonalLinesCam.length, "#ec4899"],
-      [
-        "intersections",
-        result.intersectionsCam.length,
-        result.status.detected ? "#4ade80" : "#fb923c",
-      ],
-    ] as const;
-    const fontSize = Math.max(14, minDim / 30);
-    counts.forEach(([label, n, color], i) => {
-      const text = document.createElementNS(SVG_NS, "text");
-      text.setAttribute("x", String(fontSize));
-      text.setAttribute("y", String(fontSize * (1.4 + i * 1.2)));
-      text.setAttribute("fill", color as string);
-      text.setAttribute("stroke", "#0a0c10");
-      text.setAttribute("stroke-width", "1");
-      text.setAttribute("paint-order", "stroke");
-      text.setAttribute("font-size", String(fontSize));
-      text.setAttribute("font-family", "ui-monospace, monospace");
-      text.setAttribute("font-weight", "bold");
-      text.textContent = `${label}: ${n}`;
-      svg.appendChild(text);
-    });
+    // Stage counts now live in the legend element next to the grid-debug
+    // preview (see updateGridDebugLegend) — no text labels are painted on
+    // the camera preview.
 
     svg.removeAttribute("hidden");
+  }
+
+  private updateGridDebugLegend(): void {
+    // Color → pipeline-stage → count legend, rendered in the sidebar to the
+    // left of the grid-debug preview. Counts come from the continuous
+    // detector status (mat_grid in calibration_captured) so the legend stays
+    // live during grid-method calibration. The intersection count uses the
+    // same green/amber convention as the camera-preview overlay dots.
+    const el = q("grid-debug-legend");
+    el.replaceChildren();
+    const grid = this.state.matGrid;
+    const intersections = grid?.intersection_count ?? 0;
+    const detected = !!grid?.detected;
+    const items: [string, string, number | null][] = [
+      ["#94a3b8", "weak", grid?.weak_line_count ?? null],
+      ["#e2e8f0", "strong", grid?.strong_line_count ?? null],
+      ["#22d3ee", "axis X", grid?.axis_a_line_count ?? null],
+      ["#3b82f6", "axis Y", grid?.axis_b_line_count ?? null],
+      ["#ec4899", "diagonals", grid?.diagonal_line_count ?? null],
+      [detected ? "#4ade80" : "#fb923c", "intersections", grid ? intersections : null],
+    ];
+    const title = document.createElement("div");
+    title.className = "legend-title";
+    title.textContent = "Edge detection";
+    el.appendChild(title);
+    for (const [color, label, count] of items) {
+      const row = document.createElement("div");
+      row.className = "legend-row";
+      const lbl = document.createElement("span");
+      lbl.className = "legend-label";
+      lbl.style.color = color;
+      lbl.textContent = `━ ${label}`;
+      const cnt = document.createElement("span");
+      cnt.className = "legend-count";
+      cnt.textContent = count === null ? "—" : String(count);
+      row.append(lbl, cnt);
+      el.appendChild(row);
+    }
   }
 
   // ─── Misc actions ────────────────────────────────────────────────────────

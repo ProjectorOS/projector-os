@@ -405,6 +405,60 @@ button.link-btn:hover {
   pointer-events: none;
 }
 
+/* Grid-debug row: pairs the "what OpenCV sees" preview with a count legend on
+   the left so the user can read color → stage → count without text being
+   painted over the camera preview. The preview keeps its own margin; the row
+   itself doesn't need any so it lines up with neighboring blocks. */
+.grid-debug-row {
+  display: flex;
+  align-items: stretch;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.grid-debug-row[hidden] {
+  display: none;
+}
+.grid-debug-row .calib-preview {
+  flex: 1 1 280px;
+  min-width: 0;
+}
+.grid-debug-legend {
+  flex: 0 0 auto;
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  margin: 10px 0 12px;
+  background: #0a0c10;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-variant-numeric: tabular-nums;
+  min-width: 160px;
+}
+.grid-debug-legend .legend-title {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 10px;
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+.grid-debug-legend .legend-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+.grid-debug-legend .legend-label {
+  color: var(--fg);
+}
+.grid-debug-legend .legend-count {
+  color: var(--muted);
+}
+
 .calib-preview {
   position: relative;
   margin: 10px 0 12px;

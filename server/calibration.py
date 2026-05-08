@@ -393,6 +393,11 @@ class MatGridCapture:
 def grid_capture_to_status(capture: MatGridCapture) -> MatGridStatus:
     """Project the internal capture (with intersection arrays) onto the
     wire-friendly status payload sent in CalibrationCapturedEvent."""
+    weak = int(capture.weak_lines_cam.shape[0])
+    strong = int(capture.strong_lines_cam.shape[0])
+    axis_a = int(capture.axis_a_lines_cam.shape[0])
+    axis_b = int(capture.axis_b_lines_cam.shape[0])
+    diag = int(capture.diagonal_lines_cam.shape[0])
     if capture.detected:
         return MatGridStatus(
             detected=True,
@@ -404,6 +409,11 @@ def grid_capture_to_status(capture: MatGridCapture) -> MatGridStatus:
             intersection_count=int(capture.intersections_cam.shape[0]),
             confidence=capture.confidence,
             reason=None,
+            weak_line_count=weak,
+            strong_line_count=strong,
+            axis_a_line_count=axis_a,
+            axis_b_line_count=axis_b,
+            diagonal_line_count=diag,
         )
     return MatGridStatus(
         detected=False,
@@ -415,6 +425,11 @@ def grid_capture_to_status(capture: MatGridCapture) -> MatGridStatus:
         intersection_count=0,
         confidence=0.0,
         reason=capture.reason,
+        weak_line_count=weak,
+        strong_line_count=strong,
+        axis_a_line_count=axis_a,
+        axis_b_line_count=axis_b,
+        diagonal_line_count=diag,
     )
 
 
