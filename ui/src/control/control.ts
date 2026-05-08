@@ -11,6 +11,8 @@
 
 import type {
   Calibration,
+  CalibrationMethod,
+  CameraRoi,
   DetectedObject,
   MatGridStatus,
   Mode,
@@ -71,12 +73,36 @@ interface FrameStats {
   receivedAt: number;
 }
 
+interface ExplicitGridResult {
+  // Latest result from a user-triggered "Detect grid" run. Independent of the
+  // auto-detection that fires when 4 ArUco markers are visible, so we can
+  // surface "is the detector finding the mat at all?" diagnostically.
+  status: MatGridStatus;
+  intersectionsCam: [number, number][];
+  weakLinesCam: [number, number, number, number][];
+  strongLinesCam: [number, number, number, number][];
+  axisALinesCam: [number, number, number, number][];
+  axisBLinesCam: [number, number, number, number][];
+  diagonalLinesCam: [number, number, number, number][];
+  frameWidth: number;
+  frameHeight: number;
+  receivedAt: number;
+}
+
 interface ViewState {
   mode: Mode;
   connection: "connecting" | "open" | "closed";
   calibration: Calibration | null;
   projector: [number, number] | null;
+  // Which calibration flow the server is currently running. Set when the user
+  // clicks one of the two Calibrate buttons; reset on calibration_prompt and
+  // mode_changed.
+  calibrationMethod: CalibrationMethod;
   capturedMarkers: number;
+  // Grid method only: number of bright-dot blob candidates the server saw
+  // this frame (not necessarily 4 of them sortable into corners).
+  detectedDotCount: number;
+  detectedDotsCam: [number, number][];
   calibDiag: CalibrationDiagnostic | null;
   // Latest cutting-mat grid detection state from the server. null means no
   // calibration_captured event has arrived yet this session.
@@ -97,6 +123,13 @@ interface ViewState {
   cameraError: string | null;
   switchingCamera: boolean;
   frameStats: FrameStats | null;
+  explicitGrid: ExplicitGridResult | null;
+  detectGridPending: boolean;
+  cameraRoi: CameraRoi | null;
+  // Camera frame size, learned from the most recent calibration_captured
+  // event. Needed to scale drag interactions and to default the ROI to a
+  // sane initial rectangle when the user starts dragging without one.
+  cameraFrame: { width: number; height: number } | null;
 }
 
 const SERVER_HTTP = defaultServerHttpUrl();
@@ -112,7 +145,10 @@ class ControlApp {
     connection: "connecting",
     calibration: null,
     projector: null,
+    calibrationMethod: "aruco",
     capturedMarkers: 0,
+    detectedDotCount: 0,
+    detectedDotsCam: [],
     calibDiag: null,
     matGrid: null,
     useRuler: false,
@@ -129,11 +165,37 @@ class ControlApp {
     cameraError: null,
     switchingCamera: false,
     frameStats: null,
+    explicitGrid: null,
+    detectGridPending: false,
+    cameraRoi: null,
+    cameraFrame: null,
   };
   private readonly ws: WsClient;
   // Whether the camera <img> currently has its MJPEG src attribute set. Used to avoid
   // restarting the long-lived multipart HTTP connection on every render.
   private cameraPreviewActive = false;
+  // Same idea for the second "what OpenCV sees" stream — toggled on entering
+  // grid-calibrate mode, off on leaving.
+  private gridPreviewActive = false;
+  // Same again for the keystone-corrected ("rectified") preview.
+  private gridRectifiedPreviewActive = false;
+  // Cursor-magnifier focus point in cam-pixel coords. Set from (in priority
+  // order) the corner currently being dragged → cursor position over the
+  // preview → camera-frame center as a fallback once dimensions are known.
+  // The magnifier stays visible whenever the camera preview is live; the
+  // focus point determines what's centered in the magnified view.
+  private magnifierFocus: { x: number; y: number } | null = null;
+  // Index of the ROI corner the magnifier is currently focused on (0=TL,
+  // 1=TR, 2=BR, 3=BL). Set when hovering over OR dragging a corner handle.
+  // Switches the magnifier crosshair from the default green plus to two
+  // cyan rays along the polygon edges meeting at that corner.
+  private magnifierCornerIdx: number | null = null;
+  // True while a corner drag is in progress. Lets the corner-drag handler
+  // own the magnifier focus across pointer moves without the cam-preview's
+  // hover-detect handler overwriting it (e.g. when the cursor briefly
+  // leaves the moving handle's hit area mid-drag).
+  private magnifierCornerDragActive = false;
+  private magnifierRaf: number | null = null;
   // The user's typed measurement, kept here so we can pre-fill from a saved
   // calibration without forcing a render.
   private pendingMm = "";
@@ -244,8 +306,11 @@ class ControlApp {
     q("mode-idle-btn").addEventListener("click", () =>
       this.ws.send({ type: "set_mode", mode: "idle" }),
     );
-    q("mode-calibrate-btn").addEventListener("click", () =>
-      this.ws.send({ type: "start_calibration" }),
+    q("mode-calibrate-aruco-btn").addEventListener("click", () =>
+      this.ws.send({ type: "start_calibration", method: "aruco" }),
+    );
+    q("mode-calibrate-grid-btn").addEventListener("click", () =>
+      this.ws.send({ type: "start_calibration", method: "grid" }),
     );
     q("mode-track-btn").addEventListener("click", () =>
       this.ws.send({ type: "set_mode", mode: "track" }),
@@ -269,6 +334,24 @@ class ControlApp {
       this.state.useRuler = false;
       this.applyCalibrationCard();
     });
+    q("detect-grid-btn").addEventListener("click", () => {
+      this.state.detectGridPending = true;
+      this.ws.send({ type: "detect_grid" });
+      this.applyCalibrationCard();
+    });
+    q("camera-roi-reset-btn").addEventListener("click", () => {
+      this.ws.send({ type: "set_camera_roi", corners: [], clear: true });
+    });
+
+    // Cursor magnifier — always shown when the camera preview is live.
+    // Pointer-move over the preview retargets the focus point; cursor
+    // leaving doesn't hide the magnifier (focus stays at the last value
+    // until something else updates it). Corner-drag handlers below override
+    // the focus to follow the marker being dragged instead of the cursor.
+    const camPreview = q("cam-preview");
+    camPreview.addEventListener("pointermove", (ev) =>
+      this.handleMagnifierPointerMove(ev),
+    );
   }
 
   // ─── Server events ───────────────────────────────────────────────────────
@@ -287,7 +370,10 @@ class ControlApp {
         this.applyHeartbeat();
         return;
       case "calibration_captured":
+        this.state.calibrationMethod = ev.method;
         this.state.capturedMarkers = ev.detected_marker_ids.length;
+        this.state.detectedDotCount = ev.detected_dot_count;
+        this.state.detectedDotsCam = ev.detected_dots_cam;
         this.state.calibDiag = {
           detectedIds: ev.detected_marker_ids,
           detectedCorners: ev.detected_corners_cam,
@@ -296,6 +382,13 @@ class ControlApp {
           rejectedCount: ev.rejected_count,
           lastSeenAt: Date.now(),
         };
+        if (ev.frame_width > 0 && ev.frame_height > 0) {
+          this.state.cameraFrame = {
+            width: ev.frame_width,
+            height: ev.frame_height,
+          };
+          this.updateCameraRoiOverlay();
+        }
         this.state.matGrid = ev.mat_grid;
         this.applyCalibrationCard();
         this.updateMarkerOverlay();
@@ -312,6 +405,7 @@ class ControlApp {
         this.state.showWorkSurfaceOutline = ev.show_work_surface_outline;
         this.state.cameraIndex = ev.camera_index;
         this.state.cameraOpen = ev.camera_open;
+        this.state.cameraRoi = ev.camera_roi;
         if (ev.calibration && !this.pendingMm) {
           this.pendingMm = formatMmForInput(ev.calibration.mat_width_mm);
           q<HTMLInputElement>("measurement-input").value = this.pendingMm;
@@ -322,14 +416,19 @@ class ControlApp {
         this.state.mode = ev.mode;
         if (ev.mode !== "calibrate") {
           this.state.capturedMarkers = 0;
+          this.state.detectedDotCount = 0;
+          this.state.detectedDotsCam = [];
           this.state.calibDiag = null;
           this.state.matGrid = null;
           this.state.useRuler = false;
+          this.state.explicitGrid = null;
+          this.state.detectGridPending = false;
         }
         this.applyMode();
         this.applyCalibrationCard();
         this.applyDetections();
         this.updateMarkerOverlay();
+        this.updateGridOverlay();
         return;
       case "calibration_updated":
         this.state.calibration = ev.calibration;
@@ -337,12 +436,35 @@ class ControlApp {
         this.applyMode();
         return;
       case "calibration_prompt":
+        this.state.calibrationMethod = ev.method;
         this.state.capturedMarkers = 0;
+        this.state.detectedDotCount = 0;
+        this.state.detectedDotsCam = [];
         this.state.calibDiag = null;
         this.state.matGrid = null;
         this.state.useRuler = false;
+        this.state.explicitGrid = null;
+        this.state.detectGridPending = false;
         this.applyCalibrationCard();
         this.updateMarkerOverlay();
+        this.updateGridOverlay();
+        return;
+      case "mat_grid_detected":
+        this.state.explicitGrid = {
+          status: ev.grid,
+          intersectionsCam: ev.intersections_cam,
+          weakLinesCam: ev.weak_lines_cam,
+          strongLinesCam: ev.strong_lines_cam,
+          axisALinesCam: ev.axis_a_lines_cam,
+          axisBLinesCam: ev.axis_b_lines_cam,
+          diagonalLinesCam: ev.diagonal_lines_cam,
+          frameWidth: ev.frame_width,
+          frameHeight: ev.frame_height,
+          receivedAt: Date.now(),
+        };
+        this.state.detectGridPending = false;
+        this.applyCalibrationCard();
+        this.updateGridOverlay();
         return;
       case "projector_registered":
         this.state.projector = [ev.proj_width, ev.proj_height];
@@ -364,6 +486,11 @@ class ControlApp {
         this.state.cameraError = ev.error;
         this.state.switchingCamera = false;
         this.applyCameraCard();
+        this.applyCalibrationCard();
+        return;
+      case "camera_roi_updated":
+        this.state.cameraRoi = ev.camera_roi;
+        this.updateCameraRoiOverlay();
         this.applyCalibrationCard();
         return;
     }
@@ -453,13 +580,28 @@ class ControlApp {
 
   private applyMode(): void {
     const cls = this.state.mode === "track" ? "ok" : this.state.mode === "calibrate" ? "warn" : "muted";
-    setPill(q("mode-pill"), cls, this.state.mode);
+    const label =
+      this.state.mode === "calibrate"
+        ? `calibrate (${this.state.calibrationMethod})`
+        : this.state.mode;
+    setPill(q("mode-pill"), cls, label);
 
     setActive(q("mode-idle-btn"), this.state.mode === "idle");
-    setActive(q("mode-calibrate-btn"), this.state.mode === "calibrate", "primary");
+    setActive(
+      q("mode-calibrate-aruco-btn"),
+      this.state.mode === "calibrate" && this.state.calibrationMethod === "aruco",
+      "primary",
+    );
+    setActive(
+      q("mode-calibrate-grid-btn"),
+      this.state.mode === "calibrate" && this.state.calibrationMethod === "grid",
+      "primary",
+    );
     setActive(q("mode-track-btn"), this.state.mode === "track");
 
-    q<HTMLButtonElement>("mode-calibrate-btn").disabled = !this.state.projector;
+    const noProjector = !this.state.projector;
+    q<HTMLButtonElement>("mode-calibrate-aruco-btn").disabled = noProjector;
+    q<HTMLButtonElement>("mode-calibrate-grid-btn").disabled = noProjector;
     q<HTMLButtonElement>("mode-track-btn").disabled = !this.state.calibration;
 
     const help = q("mode-help");
@@ -609,6 +751,14 @@ class ControlApp {
         : `Camera ${this.state.cameraIndex}`;
       this.applyCameraPreviewVisuals();
       this.applyHeartbeat();
+      // Magnifier is always visible alongside a live preview. Focus
+      // defaults to camera-frame center until the cursor or a corner drag
+      // overrides it.
+      if (!this.previewHidden) {
+        q("cam-magnifier").removeAttribute("hidden");
+        this.ensureMagnifierFocus();
+        this.startMagnifierLoop();
+      }
     }
 
     if (showPicker) {
@@ -650,6 +800,10 @@ class ControlApp {
     // Stop the MJPEG stream when the preview is no longer visible.
     if (!live || this.previewHidden) {
       this.stopCameraPreview();
+      // Magnifier piggybacks on the same <img>; tear it down too. Keep the
+      // last focus so it resumes from the same spot when the preview reopens.
+      q("cam-magnifier").setAttribute("hidden", "");
+      this.stopMagnifierLoop();
     }
   }
 
@@ -664,6 +818,220 @@ class ControlApp {
       const img = q<HTMLImageElement>("cam-preview-img");
       img.src = `${SERVER_HTTP}/camera/preview.mjpg`;
       this.cameraPreviewActive = true;
+    }
+  }
+
+  private handleMagnifierPointerMove(ev: PointerEvent): void {
+    // While a corner drag is in progress, the drag handler owns focus +
+    // cornerIdx — don't let cam-preview hover detection override it.
+    if (this.magnifierCornerDragActive) return;
+    // If the cursor is hovering over an ROI corner handle, snap focus to
+    // that corner's exact position and switch to corner-mode crosshair.
+    // The data-roi-handle attribute is set on each circle in
+    // updateCameraRoiOverlay; its value is the corner index 0..3.
+    const target = ev.target as Element | null;
+    const handleAttr = target?.getAttribute?.("data-roi-handle") ?? null;
+    const corners = this.state.cameraRoi?.corners;
+    if (
+      handleAttr !== null &&
+      /^\d+$/.test(handleAttr) &&
+      corners &&
+      corners.length === 4
+    ) {
+      const idx = Number(handleAttr);
+      if (idx >= 0 && idx < 4) {
+        const c = corners[idx];
+        this.magnifierFocus = { x: c[0], y: c[1] };
+        this.magnifierCornerIdx = idx;
+        return;
+      }
+    }
+    const img = q<HTMLImageElement>("cam-preview-img");
+    if (!img.naturalWidth || !img.naturalHeight) return;
+    const rect = img.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+
+    // The <img> uses object-fit: contain, so the rendered image may be
+    // letterboxed within its bounding box. Compute the actual rendered area
+    // first, then map the cursor into natural-image coordinates.
+    const naturalAspect = img.naturalWidth / img.naturalHeight;
+    const elAspect = rect.width / rect.height;
+    let renderedW: number, renderedH: number, offsetX: number, offsetY: number;
+    if (naturalAspect > elAspect) {
+      renderedW = rect.width;
+      renderedH = rect.width / naturalAspect;
+      offsetX = 0;
+      offsetY = (rect.height - renderedH) / 2;
+    } else {
+      renderedH = rect.height;
+      renderedW = rect.height * naturalAspect;
+      offsetY = 0;
+      offsetX = (rect.width - renderedW) / 2;
+    }
+    const lx = ev.clientX - rect.left - offsetX;
+    const ly = ev.clientY - rect.top - offsetY;
+    if (lx < 0 || ly < 0 || lx > renderedW || ly > renderedH) {
+      // Outside the rendered image area — keep the existing focus rather
+      // than hiding the magnifier, since the spec is to always show it.
+      return;
+    }
+    this.magnifierFocus = {
+      x: (lx / renderedW) * img.naturalWidth,
+      y: (ly / renderedH) * img.naturalHeight,
+    };
+    // Cursor takes over focus → leave corner mode so the crosshair reverts
+    // to the default green plus.
+    this.magnifierCornerIdx = null;
+  }
+
+  private ensureMagnifierFocus(): void {
+    // Default focus = camera-frame center, picked once we know dimensions.
+    // Used on first show before any pointer/drag has set a focus.
+    if (this.magnifierFocus !== null) return;
+    const img = q<HTMLImageElement>("cam-preview-img");
+    if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+      this.magnifierFocus = {
+        x: img.naturalWidth / 2,
+        y: img.naturalHeight / 2,
+      };
+    } else if (this.state.cameraFrame) {
+      this.magnifierFocus = {
+        x: this.state.cameraFrame.width / 2,
+        y: this.state.cameraFrame.height / 2,
+      };
+    }
+  }
+
+  private startMagnifierLoop(): void {
+    // Make sure the magnifier <img> is connected to the same MJPEG stream as
+    // the main preview. The browser opens its own connection per element —
+    // a small bandwidth hit on localhost — but the upside is no per-frame JS
+    // work: scaling and cropping are handled entirely by CSS transform +
+    // overflow:hidden on the container.
+    const magImg = q<HTMLImageElement>("cam-magnifier-img");
+    const desired = `${SERVER_HTTP}/camera/preview.mjpg`;
+    if (magImg.getAttribute("src") !== desired) {
+      magImg.src = desired;
+    }
+    if (this.magnifierRaf !== null) return;
+    const tick = (): void => {
+      this.updateMagnifierTransform();
+      this.updateMagnifierCrosshair();
+      this.magnifierRaf = requestAnimationFrame(tick);
+    };
+    this.magnifierRaf = requestAnimationFrame(tick);
+  }
+
+  private updateMagnifierCrosshair(): void {
+    const svg = q<SVGSVGElement>("cam-magnifier-crosshair");
+    svg.replaceChildren();
+    const cornerIdx = this.magnifierCornerIdx;
+    const corners = this.state.cameraRoi?.corners;
+    if (cornerIdx !== null && corners && corners.length === 4) {
+      // Corner mode: two cyan rays from the magnifier center pointing along
+      // the polygon's edges that meet at the dragged corner. The actual
+      // edge directions are used (not just up/down/left/right) so even a
+      // skewed polygon's rays match its outline.
+      const center = corners[cornerIdx];
+      const adjacents = [
+        corners[(cornerIdx + 3) % 4], // counter-clockwise neighbor
+        corners[(cornerIdx + 1) % 4], // clockwise neighbor
+      ];
+      // viewBox is 0..100 with preserveAspectRatio="none" → coords are
+      // % of the magnifier in each axis. Center is (50, 50).
+      for (const adj of adjacents) {
+        const dx = adj[0] - center[0];
+        const dy = adj[1] - center[1];
+        if (dx === 0 && dy === 0) continue;
+        // Find where the ray from (50, 50) in direction (dx, dy) exits the
+        // 0..100 viewBox — that's our line endpoint.
+        const tx = Math.abs(dx) > 0 ? 50 / Math.abs(dx) : Infinity;
+        const ty = Math.abs(dy) > 0 ? 50 / Math.abs(dy) : Infinity;
+        const t = Math.min(tx, ty);
+        const ex = 50 + dx * t;
+        const ey = 50 + dy * t;
+        const line = document.createElementNS(SVG_NS, "line");
+        line.setAttribute("x1", "50");
+        line.setAttribute("y1", "50");
+        line.setAttribute("x2", String(ex));
+        line.setAttribute("y2", String(ey));
+        line.setAttribute("stroke", "#22d3ee");
+        line.setAttribute("stroke-width", "1");
+        line.setAttribute("vector-effect", "non-scaling-stroke");
+        svg.appendChild(line);
+      }
+      // Small cyan dot at the center marking the corner's exact position.
+      const dot = document.createElementNS(SVG_NS, "circle");
+      dot.setAttribute("cx", "50");
+      dot.setAttribute("cy", "50");
+      dot.setAttribute("r", "1.2");
+      dot.setAttribute("fill", "#22d3ee");
+      dot.setAttribute("vector-effect", "non-scaling-stroke");
+      svg.appendChild(dot);
+      return;
+    }
+    // Default: green plus crosshair with a small box.
+    const box = document.createElementNS(SVG_NS, "rect");
+    box.setAttribute("x", "47");
+    box.setAttribute("y", "47");
+    box.setAttribute("width", "6");
+    box.setAttribute("height", "6");
+    box.setAttribute("fill", "none");
+    box.setAttribute("stroke", "#4ade80");
+    box.setAttribute("stroke-width", "1");
+    box.setAttribute("vector-effect", "non-scaling-stroke");
+    svg.appendChild(box);
+    const v = document.createElementNS(SVG_NS, "line");
+    v.setAttribute("x1", "50");
+    v.setAttribute("y1", "44");
+    v.setAttribute("x2", "50");
+    v.setAttribute("y2", "56");
+    v.setAttribute("stroke", "#4ade80");
+    v.setAttribute("stroke-width", "1");
+    v.setAttribute("vector-effect", "non-scaling-stroke");
+    svg.appendChild(v);
+    const h = document.createElementNS(SVG_NS, "line");
+    h.setAttribute("x1", "44");
+    h.setAttribute("y1", "50");
+    h.setAttribute("x2", "56");
+    h.setAttribute("y2", "50");
+    h.setAttribute("stroke", "#4ade80");
+    h.setAttribute("stroke-width", "1");
+    h.setAttribute("vector-effect", "non-scaling-stroke");
+    svg.appendChild(h);
+  }
+
+  private stopMagnifierLoop(): void {
+    if (this.magnifierRaf !== null) {
+      cancelAnimationFrame(this.magnifierRaf);
+      this.magnifierRaf = null;
+    }
+    const magImg = q<HTMLImageElement>("cam-magnifier-img");
+    // Detach the MJPEG connection when the magnifier hides.
+    magImg.removeAttribute("src");
+  }
+
+  private updateMagnifierTransform(): void {
+    this.ensureMagnifierFocus();
+    const focus = this.magnifierFocus;
+    if (!focus) return;
+    const magImg = q<HTMLImageElement>("cam-magnifier-img");
+    if (!magImg.naturalWidth || !magImg.naturalHeight) return;
+    const container = q<HTMLDivElement>("cam-magnifier");
+    const cw = container.clientWidth;
+    const ch = container.clientHeight;
+    if (cw <= 0 || ch <= 0) return;
+    const ZOOM = 4;
+    // With transform-origin: 0 0 and transform "scale(z) translate(tx, ty)",
+    // a source point (x, y) maps to (z*(x + tx), z*(y + ty)).
+    // We want the focus point to land at the container center:
+    //   z*(focus.x + tx) = cw/2 → tx = cw/(2z) - focus.x
+    //   z*(focus.y + ty) = ch/2 → ty = ch/(2z) - focus.y
+    const tx = cw / (2 * ZOOM) - focus.x;
+    const ty = ch / (2 * ZOOM) - focus.y;
+    const transform = `scale(${ZOOM}) translate(${tx}px, ${ty}px)`;
+    if (magImg.style.transform !== transform) {
+      magImg.style.transform = transform;
     }
   }
 
@@ -704,7 +1072,19 @@ class ControlApp {
   }
 
   private applyCalibrationCard(): void {
-    if (this.state.mode !== "calibrate") return;
+    if (this.state.mode !== "calibrate") {
+      // Tear down the grid-debug + rectified streams so we don't keep MJPEG
+      // connections open after leaving calibrate mode.
+      if (this.gridPreviewActive) {
+        q<HTMLImageElement>("grid-debug-preview-img").removeAttribute("src");
+        this.gridPreviewActive = false;
+      }
+      if (this.gridRectifiedPreviewActive) {
+        q<HTMLImageElement>("grid-rectified-preview-img").removeAttribute("src");
+        this.gridRectifiedPreviewActive = false;
+      }
+      return;
+    }
 
     const noCamera = q("calib-no-camera");
     const noProjector = q("calib-no-projector");
@@ -724,6 +1104,26 @@ class ControlApp {
     noCamera.hidden = true;
     noProjector.hidden = true;
     body.hidden = false;
+
+    if (this.state.calibrationMethod === "grid") {
+      this.applyCalibrationCardGrid();
+      return;
+    }
+
+    // Re-show ArUco-only UI in case we switched back from grid mode.
+    q("grid-detect-block").hidden = false;
+    q("grid-debug-preview").hidden = true;
+    q("grid-rectified-preview").hidden = true;
+    q("camera-roi-controls").hidden = true;
+    q<SVGSVGElement>("camera-roi-overlay").setAttribute("hidden", "");
+    if (this.gridPreviewActive) {
+      q<HTMLImageElement>("grid-debug-preview-img").removeAttribute("src");
+      this.gridPreviewActive = false;
+    }
+    if (this.gridRectifiedPreviewActive) {
+      q<HTMLImageElement>("grid-rectified-preview-img").removeAttribute("src");
+      this.gridRectifiedPreviewActive = false;
+    }
 
     const status = q("calib-status");
     status.replaceChildren();
@@ -816,6 +1216,175 @@ class ControlApp {
     q<HTMLButtonElement>("calib-save-btn").disabled =
       passiveAvailable ? false : this.state.capturedMarkers < 4;
     this.refreshMeasurementHint();
+    this.applyExplicitGridResult();
+  }
+
+  private applyCalibrationCardGrid(): void {
+    // Grid-only calibration UI: 4 detected dots + a detected mat grid → Save.
+    // We reuse the existing DOM nodes (calib-status, calib-grid-pill,
+    // calib-diag-hint, calib-save-btn) and hide the ArUco-specific bits
+    // (ruler input, ruler/grid toggles, measurement hint) since neither
+    // applies in grid-only mode.
+    const status = q("calib-status");
+    status.replaceChildren();
+    const dotCount = this.state.detectedDotCount;
+    const dotsSorted = this.state.detectedDotsCam.length === 4;
+    const dotsPill = document.createElement("span");
+    if (dotsSorted) {
+      dotsPill.className = "pill ok";
+      dotsPill.textContent = "All 4 dots detected";
+    } else if (dotCount > 0) {
+      dotsPill.className = "pill warn";
+      dotsPill.textContent = `${Math.min(dotCount, 4)}/4 dots detected`;
+    } else {
+      dotsPill.className = "pill error";
+      dotsPill.textContent = "0/4 dots detected";
+    }
+    status.appendChild(dotsPill);
+
+    const gridPill = q("calib-grid-pill");
+    gridPill.replaceChildren();
+    gridPill.hidden = false;
+    const grid = this.state.matGrid;
+    const gridSpan = document.createElement("span");
+    if (grid && grid.detected) {
+      gridSpan.className = "pill ok";
+      gridSpan.textContent = describeGrid(grid);
+    } else if (grid && grid.reason) {
+      gridSpan.className = "pill warn";
+      gridSpan.textContent = `Grid: ${grid.reason}`;
+    } else {
+      gridSpan.className = "pill muted";
+      gridSpan.textContent = "Waiting for grid…";
+    }
+    gridPill.appendChild(gridSpan);
+
+    const hint = q("calib-diag-hint");
+    hint.className = "help";
+    if (!dotsSorted && dotCount === 0) {
+      hint.textContent =
+        "Camera doesn't see any bright dots yet. Check the projector window is open and pointed at the mat, and dim ambient light if there are competing bright surfaces.";
+    } else if (!dotsSorted) {
+      hint.textContent =
+        "Some dots aren't visible to the camera — check that the work surface is fully in frame and there's nothing brighter in the scene.";
+    } else if (!grid?.detected) {
+      hint.textContent =
+        "All 4 dots are visible. Now place the cutting mat under the projection so the printed grid is in view; the detector needs a clean view of the grid lines to lock on.";
+    } else {
+      hint.textContent =
+        "Ready to save. The grid provides scale; the dots provide the projector mapping.";
+    }
+
+    // Hide ArUco-specific UI.
+    q("calib-measure-row").hidden = true;
+    q<HTMLButtonElement>("use-ruler-toggle").hidden = true;
+    q<HTMLButtonElement>("use-grid-toggle").hidden = true;
+    q("measurement-hint").textContent = "";
+    // Grid runs continuously here, so the manual "Detect grid" button is
+    // redundant. Hide the whole block.
+    q("grid-detect-block").hidden = true;
+    // Show the "what OpenCV sees" preview and start the MJPEG stream.
+    q("grid-debug-preview").hidden = false;
+    if (!this.gridPreviewActive) {
+      q<HTMLImageElement>("grid-debug-preview-img").src = `${SERVER_HTTP}/camera/grid_preview.mjpg`;
+      this.gridPreviewActive = true;
+    }
+    // And the keystone-corrected preview.
+    q("grid-rectified-preview").hidden = false;
+    if (!this.gridRectifiedPreviewActive) {
+      q<HTMLImageElement>("grid-rectified-preview-img").src = `${SERVER_HTTP}/camera/grid_rectified.mjpg`;
+      this.gridRectifiedPreviewActive = true;
+    }
+
+    // Camera-ROI controls — drag handles render via updateCameraRoiOverlay().
+    q("camera-roi-controls").hidden = false;
+    const roiInfo = q("camera-roi-info");
+    const roiResetBtn = q<HTMLButtonElement>("camera-roi-reset-btn");
+    if (this.state.cameraRoi && this.state.cameraRoi.corners.length === 4) {
+      roiInfo.textContent =
+        "Camera ROI polygon set — keystone correction is applied to grid detection. Drag any corner to refine.";
+      roiResetBtn.hidden = false;
+    } else {
+      roiInfo.textContent =
+        "No camera ROI set — drag the 4 cyan corners on the preview to align the polygon with the mat boundary.";
+      roiResetBtn.hidden = true;
+    }
+    this.updateCameraRoiOverlay();
+
+    q<HTMLButtonElement>("calib-save-btn").disabled =
+      !(dotsSorted && grid?.detected);
+  }
+
+  private applyExplicitGridResult(): void {
+    const btn = q<HTMLButtonElement>("detect-grid-btn");
+    const resultRow = q("explicit-grid-result");
+    btn.disabled = !this.state.cameraOpen || this.state.detectGridPending;
+    btn.textContent = this.state.detectGridPending ? "Detecting…" : "Detect grid";
+
+    // Always render the result row so the user can tell whether a click
+    // produced a server response. Three states: pending (request in flight),
+    // no result yet (button never clicked), and result (success or failure).
+    resultRow.hidden = false;
+    resultRow.replaceChildren();
+    const result = this.state.explicitGrid;
+    if (this.state.detectGridPending) {
+      const pill = document.createElement("span");
+      pill.className = "pill warn";
+      pill.textContent = "Waiting for camera frame…";
+      resultRow.appendChild(pill);
+      return;
+    }
+    if (!result) {
+      const pill = document.createElement("span");
+      pill.className = "pill muted";
+      pill.textContent = "No detection yet";
+      resultRow.appendChild(pill);
+      return;
+    }
+    const pill = document.createElement("span");
+    if (result.status.detected) {
+      pill.className = "pill ok";
+      pill.textContent = describeGrid(result.status);
+    } else {
+      pill.className = "pill error";
+      pill.textContent = "Not detected";
+    }
+    resultRow.appendChild(pill);
+
+    const detail = document.createElement("span");
+    detail.className = "help";
+    if (result.status.detected) {
+      const conf = (result.status.confidence * 100).toFixed(0);
+      detail.textContent = `${result.status.intersection_count} intersection${result.status.intersection_count === 1 ? "" : "s"} · confidence ${conf}%`;
+    } else if (result.status.reason) {
+      detail.textContent = result.status.reason;
+    } else {
+      detail.textContent = "";
+    }
+    resultRow.appendChild(detail);
+
+    // Legend mapping camera-preview overlay colors to pipeline stages so the
+    // user can read "axes not separable" + a screenful of gray lines as
+    // "Hough found edges but they didn't cluster into two perpendicular sets".
+    const legend = document.createElement("div");
+    legend.className = "help";
+    legend.style.marginTop = "4px";
+    const legendItems: [string, string, number][] = [
+      ["#94a3b8", "━ weak", result.weakLinesCam.length],
+      ["#e2e8f0", "━ strong", result.strongLinesCam.length],
+      ["#22d3ee", "━ axis X", result.axisALinesCam.length],
+      ["#3b82f6", "━ axis Y", result.axisBLinesCam.length],
+      ["#ec4899", "━ diagonals", result.diagonalLinesCam.length],
+      ["#4ade80", "● intersection", result.intersectionsCam.length],
+    ];
+    legendItems.forEach(([color, text, count], i) => {
+      if (i > 0) legend.append(" · ");
+      const swatch = document.createElement("span");
+      swatch.style.color = color;
+      swatch.textContent = `${text} (${count})`;
+      legend.append(swatch);
+    });
+    resultRow.appendChild(legend);
   }
 
   private applyDetections(): void {
@@ -1028,6 +1597,39 @@ class ControlApp {
     }
     svg.setAttribute("viewBox", `0 0 ${diag.frameWidth} ${diag.frameHeight}`);
     svg.replaceChildren();
+
+    if (this.state.calibrationMethod === "grid") {
+      // Grid method: show the 4 sorted dot centers. Each dot is labelled
+      // with its corner role (TL/TR/BR/BL) so the user can see the corner
+      // assignment is correct.
+      const cornerLabels = ["TL", "TR", "BR", "BL"];
+      const r = Math.max(8, Math.min(diag.frameWidth, diag.frameHeight) / 80);
+      this.state.detectedDotsCam.forEach((pt, i) => {
+        const dot = document.createElementNS(SVG_NS, "circle");
+        dot.setAttribute("cx", String(pt[0]));
+        dot.setAttribute("cy", String(pt[1]));
+        dot.setAttribute("r", String(r));
+        dot.setAttribute("fill", "rgba(74,222,128,0.3)");
+        dot.setAttribute("stroke", "#4ade80");
+        dot.setAttribute("stroke-width", "3");
+        svg.appendChild(dot);
+        const label = document.createElementNS(SVG_NS, "text");
+        label.setAttribute("x", String(pt[0]));
+        label.setAttribute("y", String(pt[1] - r - 6));
+        label.setAttribute("text-anchor", "middle");
+        label.setAttribute("fill", "#4ade80");
+        label.setAttribute("stroke", "#0a0c10");
+        label.setAttribute("stroke-width", "0.5");
+        label.setAttribute("font-size", "32");
+        label.setAttribute("font-weight", "bold");
+        label.setAttribute("font-family", "ui-monospace, monospace");
+        label.textContent = cornerLabels[i];
+        svg.appendChild(label);
+      });
+      svg.removeAttribute("hidden");
+      return;
+    }
+
     diag.detectedIds.forEach((id, i) => {
       const corners = diag.detectedCorners[i];
       if (!corners || corners.length !== 4) return;
@@ -1057,6 +1659,343 @@ class ControlApp {
     svg.removeAttribute("hidden");
   }
 
+  private updateCameraRoiOverlay(): void {
+    const svg = q<SVGSVGElement>("camera-roi-overlay");
+    const visible =
+      this.state.mode === "calibrate" &&
+      this.state.calibrationMethod === "grid" &&
+      this.state.cameraFrame !== null;
+    if (!visible || !this.state.cameraFrame) {
+      svg.setAttribute("hidden", "");
+      svg.replaceChildren();
+      return;
+    }
+    const fw = this.state.cameraFrame.width;
+    const fh = this.state.cameraFrame.height;
+    svg.setAttribute("viewBox", `0 0 ${fw} ${fh}`);
+
+    // Default the polygon to a 10% inset rectangle when none is set yet so
+    // the user has 4 corners to grab onto without making a committing API
+    // call until they actually drag.
+    let corners: [number, number][];
+    if (this.state.cameraRoi && this.state.cameraRoi.corners.length === 4) {
+      corners = this.state.cameraRoi.corners.map(
+        ([x, y]) => [x, y] as [number, number],
+      );
+    } else {
+      const ix = Math.round(fw * 0.1);
+      const iy = Math.round(fh * 0.1);
+      const iw = Math.round(fw * 0.8);
+      const ih = Math.round(fh * 0.8);
+      corners = [
+        [ix, iy],            // TL
+        [ix + iw, iy],       // TR
+        [ix + iw, iy + ih],  // BR
+        [ix, iy + ih],       // BL
+      ];
+    }
+    svg.replaceChildren();
+
+    // Dim mask outside the polygon. Implemented via an SVG mask: a white
+    // rectangle covering the whole frame with the polygon as a black hole.
+    // Multiplied against a semi-transparent black overlay, this produces a
+    // dimmed area outside the polygon and a fully-clear area inside.
+    const maskId = "roi-poly-mask";
+    const defs = document.createElementNS(SVG_NS, "defs");
+    const maskEl = document.createElementNS(SVG_NS, "mask");
+    maskEl.setAttribute("id", maskId);
+    const maskRect = document.createElementNS(SVG_NS, "rect");
+    maskRect.setAttribute("x", "0");
+    maskRect.setAttribute("y", "0");
+    maskRect.setAttribute("width", String(fw));
+    maskRect.setAttribute("height", String(fh));
+    maskRect.setAttribute("fill", "white");
+    maskEl.appendChild(maskRect);
+    const maskHole = document.createElementNS(SVG_NS, "polygon");
+    maskHole.setAttribute(
+      "points",
+      corners.map(([x, y]) => `${x},${y}`).join(" "),
+    );
+    maskHole.setAttribute("fill", "black");
+    maskEl.appendChild(maskHole);
+    defs.appendChild(maskEl);
+    svg.appendChild(defs);
+
+    const dim = document.createElementNS(SVG_NS, "rect");
+    dim.setAttribute("x", "0");
+    dim.setAttribute("y", "0");
+    dim.setAttribute("width", String(fw));
+    dim.setAttribute("height", String(fh));
+    dim.setAttribute("fill", "rgba(0,0,0,0.45)");
+    dim.setAttribute("mask", `url(#${maskId})`);
+    svg.appendChild(dim);
+
+    // Polygon outline — cyan dashed, drawn through the 4 corners.
+    const outline = document.createElementNS(SVG_NS, "polygon");
+    outline.setAttribute(
+      "points",
+      corners.map(([x, y]) => `${x},${y}`).join(" "),
+    );
+    outline.setAttribute("fill", "none");
+    outline.setAttribute("stroke", "#22d3ee");
+    outline.setAttribute(
+      "stroke-width",
+      String(Math.max(2, Math.min(fw, fh) / 300)),
+    );
+    outline.setAttribute(
+      "stroke-dasharray",
+      `${Math.max(6, fw / 100)} ${Math.max(4, fw / 200)}`,
+    );
+    svg.appendChild(outline);
+
+    // 4 corner handles — circles in cam-px units sized to remain grabbable
+    // at any preview scale. Labels (TL/TR/BR/BL) help the user verify the
+    // corner ordering matches the mat orientation.
+    const labels = ["TL", "TR", "BR", "BL"];
+    const r = Math.max(12, Math.min(fw, fh) / 50);
+    const fontSize = Math.max(12, Math.min(fw, fh) / 60);
+    corners.forEach(([cx, cy], i) => {
+      const handle = document.createElementNS(SVG_NS, "circle");
+      handle.setAttribute("cx", String(cx));
+      handle.setAttribute("cy", String(cy));
+      handle.setAttribute("r", String(r));
+      handle.setAttribute("fill", "rgba(34,211,238,0.4)");
+      handle.setAttribute("stroke", "#22d3ee");
+      handle.setAttribute(
+        "stroke-width",
+        String(Math.max(2, Math.min(fw, fh) / 300)),
+      );
+      handle.setAttribute("data-roi-handle", String(i));
+      handle.setAttribute("style", "cursor: grab");
+      handle.addEventListener("pointerdown", (ev) =>
+        this.startCameraRoiCornerDrag(i, ev, corners, fw, fh),
+      );
+      svg.appendChild(handle);
+
+      const label = document.createElementNS(SVG_NS, "text");
+      label.setAttribute("x", String(cx));
+      label.setAttribute("y", String(cy - r - 4));
+      label.setAttribute("text-anchor", "middle");
+      label.setAttribute("fill", "#22d3ee");
+      label.setAttribute("stroke", "#0a0c10");
+      label.setAttribute("stroke-width", "0.5");
+      label.setAttribute("font-size", String(fontSize));
+      label.setAttribute("font-family", "ui-monospace, monospace");
+      label.setAttribute("font-weight", "bold");
+      label.textContent = labels[i];
+      svg.appendChild(label);
+    });
+
+    svg.removeAttribute("hidden");
+  }
+
+  private startCameraRoiCornerDrag(
+    cornerIdx: number,
+    ev: PointerEvent,
+    startCorners: [number, number][],
+    frameW: number,
+    frameH: number,
+  ): void {
+    ev.preventDefault();
+    const target = ev.target as Element;
+    target.setPointerCapture?.(ev.pointerId);
+    this.magnifierCornerDragActive = true;
+
+    // Convert client-space deltas to cam-pixel deltas. The overlay uses
+    // preserveAspectRatio="xMidYMid meet" (matching the <img>'s `object-fit:
+    // contain`), so the viewBox is uniformly fit inside the SVG bounding
+    // rect with letterboxing. Same uniform scale applies on both axes.
+    const svg = q<SVGSVGElement>("camera-roi-overlay");
+    const rect = svg.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    const scale = Math.min(rect.width / frameW, rect.height / frameH);
+    if (scale <= 0) return;
+    const inv = 1 / scale;
+
+    const startClientX = ev.clientX;
+    const startClientY = ev.clientY;
+    const initial = startCorners.map(
+      ([x, y]) => [x, y] as [number, number],
+    );
+
+    let lastSentAt = 0;
+    const SEND_INTERVAL_MS = 80;
+
+    const onMove = (e: PointerEvent): void => {
+      const dx = (e.clientX - startClientX) * inv;
+      const dy = (e.clientY - startClientY) * inv;
+      const moved: [number, number][] = initial.map((pt, i) => {
+        if (i !== cornerIdx) return [pt[0], pt[1]];
+        return [
+          clamp(pt[0] + dx, 0, frameW),
+          clamp(pt[1] + dy, 0, frameH),
+        ];
+      });
+      this.state.cameraRoi = {
+        corners: moved.map(([x, y]) => [Math.round(x), Math.round(y)]) as [
+          number,
+          number,
+        ][],
+        updated_at: 0,
+      };
+      // Track the dragged marker with the magnifier — the user is trying to
+      // place this corner precisely, so showing the corner's current
+      // position centered (rather than the cursor's) gives a stable
+      // sub-pixel reference even if the cursor drifts.
+      this.magnifierFocus = {
+        x: moved[cornerIdx][0],
+        y: moved[cornerIdx][1],
+      };
+      this.magnifierCornerIdx = cornerIdx;
+      this.updateCameraRoiOverlay();
+      const now = performance.now();
+      if (now - lastSentAt >= SEND_INTERVAL_MS) {
+        this.sendCameraRoi(this.state.cameraRoi);
+        lastSentAt = now;
+      }
+    };
+    const onUp = (): void => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      if (this.state.cameraRoi) this.sendCameraRoi(this.state.cameraRoi);
+      // Drag ended — release magnifier ownership. Corner mode persists if
+      // the cursor is still over the handle (cam-preview hover detection
+      // re-establishes it); otherwise the next pointermove will revert to
+      // the default green plus.
+      this.magnifierCornerDragActive = false;
+      this.magnifierCornerIdx = null;
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
+  private sendCameraRoi(roi: CameraRoi): void {
+    this.ws.send({
+      type: "set_camera_roi",
+      corners: roi.corners,
+      clear: false,
+    });
+  }
+
+  private updateGridOverlay(): void {
+    const svg = q<SVGSVGElement>("grid-overlay");
+    const result = this.state.explicitGrid;
+    if (
+      this.state.mode !== "calibrate" ||
+      !result ||
+      result.frameWidth <= 0 ||
+      result.frameHeight <= 0
+    ) {
+      svg.setAttribute("hidden", "");
+      svg.replaceChildren();
+      return;
+    }
+    svg.setAttribute("viewBox", `0 0 ${result.frameWidth} ${result.frameHeight}`);
+    svg.replaceChildren();
+    const minDim = Math.min(result.frameWidth, result.frameHeight);
+
+    // viewBox frame: amber outline confirms the SVG is mounted and aligned with
+    // the camera image. If you see this rectangle but no lines inside, the
+    // detector found nothing at the corresponding pipeline stage.
+    const frame = document.createElementNS(SVG_NS, "rect");
+    frame.setAttribute("x", "0");
+    frame.setAttribute("y", "0");
+    frame.setAttribute("width", String(result.frameWidth));
+    frame.setAttribute("height", String(result.frameHeight));
+    frame.setAttribute("fill", "none");
+    frame.setAttribute("stroke", "#fbbf24");
+    frame.setAttribute("stroke-opacity", "0.7");
+    frame.setAttribute("stroke-width", String(Math.max(2, minDim / 300)));
+    frame.setAttribute("stroke-dasharray", `${minDim / 60} ${minDim / 60}`);
+    svg.appendChild(frame);
+
+    // Diagnostic layers, painted in order so later (more-specific) layers
+    // overpaint earlier (more-general) ones:
+    //  1. weak     — every Hough segment (low threshold). Gray, thin.
+    //  2. strong   — bold candidates (high threshold). White, medium.
+    //  3. axis A   — strong lines that clustered into the first grid family.
+    //  4. axis B   — strong lines in the perpendicular family.
+    //  5. intersections — major-line crossings (already snapped to lattice).
+    //
+    // Stroke widths are in cam-pixel units (= viewBox units). They need to be
+    // a meaningful fraction of the frame so they remain visible after the
+    // browser scales the SVG down to the preview size.
+    drawLineSet(svg, result.weakLinesCam, {
+      stroke: "#94a3b8",
+      strokeOpacity: "0.5",
+      strokeWidth: String(Math.max(2, minDim / 300)),
+    });
+    drawLineSet(svg, result.strongLinesCam, {
+      stroke: "#e2e8f0",
+      strokeOpacity: "0.85",
+      strokeWidth: String(Math.max(3, minDim / 200)),
+    });
+    drawLineSet(svg, result.axisALinesCam, {
+      stroke: "#22d3ee", // bright cyan = mat X axis (grid)
+      strokeOpacity: "1",
+      strokeWidth: String(Math.max(5, minDim / 120)),
+    });
+    drawLineSet(svg, result.axisBLinesCam, {
+      stroke: "#3b82f6", // bright blue = mat Y axis (grid)
+      strokeOpacity: "1",
+      strokeWidth: String(Math.max(5, minDim / 120)),
+    });
+    drawLineSet(svg, result.diagonalLinesCam, {
+      stroke: "#ec4899", // pink = strong lines off both grid axes (e.g. mat angle guides)
+      strokeOpacity: "0.95",
+      strokeWidth: String(Math.max(4, minDim / 150)),
+    });
+
+    if (result.intersectionsCam.length > 0) {
+      const dotColor = result.status.detected ? "#4ade80" : "#fb923c";
+      const radius = Math.max(6, minDim / 100);
+      for (const [x, y] of result.intersectionsCam) {
+        const dot = document.createElementNS(SVG_NS, "circle");
+        dot.setAttribute("cx", String(x));
+        dot.setAttribute("cy", String(y));
+        dot.setAttribute("r", String(radius));
+        dot.setAttribute("fill", dotColor);
+        dot.setAttribute("fill-opacity", "0.85");
+        dot.setAttribute("stroke", "#0a0c10");
+        dot.setAttribute("stroke-width", String(Math.max(1, minDim / 600)));
+        svg.appendChild(dot);
+      }
+    }
+
+    // Stage counts in the top-left corner so the user can tell at a glance
+    // which pipeline step gave up — even when a stage produced 0 segments
+    // (in which case there's nothing to draw for that color).
+    const counts = [
+      ["weak", result.weakLinesCam.length, "#94a3b8"],
+      ["strong", result.strongLinesCam.length, "#e2e8f0"],
+      ["axis X", result.axisALinesCam.length, "#22d3ee"],
+      ["axis Y", result.axisBLinesCam.length, "#3b82f6"],
+      ["diagonals", result.diagonalLinesCam.length, "#ec4899"],
+      [
+        "intersections",
+        result.intersectionsCam.length,
+        result.status.detected ? "#4ade80" : "#fb923c",
+      ],
+    ] as const;
+    const fontSize = Math.max(14, minDim / 30);
+    counts.forEach(([label, n, color], i) => {
+      const text = document.createElementNS(SVG_NS, "text");
+      text.setAttribute("x", String(fontSize));
+      text.setAttribute("y", String(fontSize * (1.4 + i * 1.2)));
+      text.setAttribute("fill", color as string);
+      text.setAttribute("stroke", "#0a0c10");
+      text.setAttribute("stroke-width", "1");
+      text.setAttribute("paint-order", "stroke");
+      text.setAttribute("font-size", String(fontSize));
+      text.setAttribute("font-family", "ui-monospace, monospace");
+      text.setAttribute("font-weight", "bold");
+      text.textContent = `${label}: ${n}`;
+      svg.appendChild(text);
+    });
+
+    svg.removeAttribute("hidden");
+  }
+
   // ─── Misc actions ────────────────────────────────────────────────────────
 
   private switchCamera(index: number | null): void {
@@ -1073,6 +2012,17 @@ class ControlApp {
   }
 
   private commitMeasurement(): void {
+    if (this.state.calibrationMethod === "grid") {
+      // Grid-only: server reads the latest dot positions + grid capture from
+      // its own state, so the command carries no measurement.
+      if (
+        this.state.detectedDotsCam.length !== 4 ||
+        !this.state.matGrid?.detected
+      )
+        return;
+      this.ws.send({ type: "finish_calibration", horizontal_mm: null });
+      return;
+    }
     if (this.state.capturedMarkers !== 4) return;
     const grid = this.state.matGrid;
     const passiveAvailable =
@@ -1134,6 +2084,27 @@ function setPill(host: HTMLElement, kind: "ok" | "warn" | "error" | "muted", tex
   span.className = `pill ${kind}`;
   span.textContent = text;
   host.appendChild(span);
+}
+
+function drawLineSet(
+  svg: SVGSVGElement,
+  lines: [number, number, number, number][],
+  attrs: { stroke: string; strokeOpacity: string; strokeWidth: string },
+): void {
+  if (lines.length === 0) return;
+  const SVG_NS_LOCAL = "http://www.w3.org/2000/svg";
+  for (const [x1, y1, x2, y2] of lines) {
+    const line = document.createElementNS(SVG_NS_LOCAL, "line");
+    line.setAttribute("x1", String(x1));
+    line.setAttribute("y1", String(y1));
+    line.setAttribute("x2", String(x2));
+    line.setAttribute("y2", String(y2));
+    line.setAttribute("stroke", attrs.stroke);
+    line.setAttribute("stroke-opacity", attrs.strokeOpacity);
+    line.setAttribute("stroke-width", attrs.strokeWidth);
+    line.setAttribute("stroke-linecap", "round");
+    svg.appendChild(line);
+  }
 }
 
 function setActive(btn: HTMLElement, active: boolean, primaryWhenInactive?: string): void {

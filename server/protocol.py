@@ -5,6 +5,7 @@ from typing import Literal, Union
 from pydantic import BaseModel, Field
 
 Mode = Literal["idle", "calibrate", "track"]
+CalibrationMethod = Literal["aruco", "grid"]
 
 
 class Calibration(BaseModel):
@@ -53,6 +54,30 @@ class WorkSurface(BaseModel):
     updated_at: float
 
 
+class CameraRoi(BaseModel):
+    """Quadrilateral in *camera* pixel space — 4 corners in TL/TR/BR/BL order.
+
+    Manually placed by the user during grid-method calibration. Serves two
+    roles simultaneously:
+
+    1. **Region mask** — every detector (ArUco, dots, mat-grid, object
+       tracker, hand tracker) sees a frame with pixels outside the polygon
+       blacked out. The MJPEG preview is unaffected — outside-polygon
+       pixels are still visible to the user, just not to the detectors.
+
+    2. **Keystone correction** — for grid detection specifically, the
+       polygon is warped to a rectangle (using its average edge lengths as
+       the target dimensions) so the cutting-mat grid appears orthogonal in
+       the warped frame before Hough analysis. Detection results are
+       transformed back to cam_px before broadcast.
+    """
+
+    # 4 [x, y] corners in TL/TR/BR/BL order. Floats so the persisted value
+    # round-trips drag deltas without integer-rounding drift.
+    corners: list[list[float]]
+    updated_at: float
+
+
 class HelloEvent(BaseModel):
     type: Literal["hello"] = "hello"
     mode: Mode
@@ -62,6 +87,7 @@ class HelloEvent(BaseModel):
     show_work_surface_outline: bool = True
     camera_index: int | None = None
     camera_open: bool = False
+    camera_roi: CameraRoi | None = None
 
 
 class ModeChangedEvent(BaseModel):
@@ -87,11 +113,18 @@ class CalibrationUpdatedEvent(BaseModel):
 
 
 class CalibrationPromptEvent(BaseModel):
-    """Sent during calibration: the projector client should draw these markers at these projector pixels."""
+    """Sent during calibration: the projector client should draw these markers at these projector pixels.
+
+    The `method` distinguishes how the projector renders the markers:
+      - "aruco" — full ArUco DICT_4X4_50 pattern PNGs at IDs 10..13 (existing flow)
+      - "grid"  — plain solid white dots; the camera locates them as bright
+        blobs while the printed cutting-mat grid provides camera↔mat scale
+    """
 
     type: Literal["calibration_prompt"] = "calibration_prompt"
     markers: list[CalibrationMarker]
     marker_size_px: int  # how many projector pixels each marker image (incl. white quiet zone) occupies
+    method: CalibrationMethod = "aruco"
 
 
 class MatGridStatus(BaseModel):
@@ -118,6 +151,40 @@ class MatGridStatus(BaseModel):
     reason: str | None = None  # populated when detected = False
 
 
+class MatGridDetectedEvent(BaseModel):
+    """Result of an explicitly-triggered mat-grid detection run.
+
+    Independent of ArUco-marker presence: the detector runs on the full camera
+    frame and skips the ArUco axis-alignment sanity check. This is purely a
+    diagnostic surface so the user can verify that the mat-grid detector
+    actually finds their cutting-mat, separately from the per-frame run that
+    only fires when all 4 calibration markers are visible.
+    """
+
+    type: Literal["mat_grid_detected"] = "mat_grid_detected"
+    grid: MatGridStatus
+    frame_width: int = 0
+    frame_height: int = 0
+    intersections_cam: list[list[float]] = Field(
+        default_factory=list,
+        description="Major-line intersections in camera pixels, for overlay rendering.",
+    )
+    # Diagnostic line segments populated by the detector at each pipeline
+    # stage — even when classification ultimately fails. Each entry is
+    # `[x1, y1, x2, y2]` in cam_px. Used by the camera-preview overlay to
+    # show which step gave up: weak lines = raw Hough output (low threshold),
+    # strong lines = bold candidates (high threshold), axis-A/B = strong
+    # lines that clustered into the two perpendicular grid families.
+    weak_lines_cam: list[list[float]] = Field(default_factory=list)
+    strong_lines_cam: list[list[float]] = Field(default_factory=list)
+    axis_a_lines_cam: list[list[float]] = Field(default_factory=list)
+    axis_b_lines_cam: list[list[float]] = Field(default_factory=list)
+    # Strong lines that don't align with either grid axis — typically the
+    # diagonal angle guides (30°, 45°, 60°) printed on most cutting mats.
+    # Surfaced for visualization only; rejected during axis selection.
+    diagonal_lines_cam: list[list[float]] = Field(default_factory=list)
+
+
 class CalibrationCapturedEvent(BaseModel):
     """Diagnostic broadcast at ~6 Hz while in calibrate mode.
 
@@ -127,12 +194,18 @@ class CalibrationCapturedEvent(BaseModel):
     """
 
     type: Literal["calibration_captured"] = "calibration_captured"
+    method: CalibrationMethod = "aruco"
     detected_marker_ids: list[int]
     detected_corners_cam: list[list[list[float]]] = []
     frame_width: int = 0
     frame_height: int = 0
     rejected_count: int = 0  # quads found but not decoded — useful when detected count = 0
     mat_grid: MatGridStatus | None = None  # null when not yet evaluated
+    # Grid-only path: cam-pixel centers of the 4 detected dots, in TL/TR/BR/BL
+    # order. Empty when fewer than 4 dots are visible (we can't disambiguate
+    # which corner is missing from a partial set). Always empty for method=aruco.
+    detected_dots_cam: list[list[float]] = Field(default_factory=list)
+    detected_dot_count: int = 0  # number of bright-dot candidates found this frame
 
 
 class ProjectorRegisteredEvent(BaseModel):
@@ -147,6 +220,11 @@ class WorkSurfaceUpdatedEvent(BaseModel):
     type: Literal["work_surface_updated"] = "work_surface_updated"
     work_surface: WorkSurface
     show_outline: bool
+
+
+class CameraRoiUpdatedEvent(BaseModel):
+    type: Literal["camera_roi_updated"] = "camera_roi_updated"
+    camera_roi: CameraRoi | None  # null when the user cleared the manual ROI
 
 
 class CameraChangedEvent(BaseModel):
@@ -179,8 +257,10 @@ ServerEvent = Union[
     CalibrationUpdatedEvent,
     CalibrationPromptEvent,
     CalibrationCapturedEvent,
+    MatGridDetectedEvent,
     ProjectorRegisteredEvent,
     WorkSurfaceUpdatedEvent,
+    CameraRoiUpdatedEvent,
     CameraChangedEvent,
     FrameStatsEvent,
 ]
@@ -200,9 +280,19 @@ class RegisterProjectorCommand(BaseModel):
 
 
 class StartCalibrationCommand(BaseModel):
-    """Trigger calibration. Uses the projector dimensions registered by the projector client."""
+    """Trigger calibration. Uses the projector dimensions registered by the projector client.
+
+    The `method` selects how the camera will lock onto the projection:
+      - "aruco" — projects ArUco DICT_4X4_50 markers; finalize via ruler
+        measurement OR (when a cutting-mat grid is also detected) the passive
+        grid-derived scale.
+      - "grid"  — projects 4 plain dots; the printed cutting-mat grid alone
+        provides camera↔mat (axes + scale + lattice). No ArUco, no ruler.
+        Requires a mat with a printed metric or imperial grid.
+    """
 
     type: Literal["start_calibration"] = "start_calibration"
+    method: CalibrationMethod = "aruco"
 
 
 class FinishCalibrationCommand(BaseModel):
@@ -217,6 +307,17 @@ class FinishCalibrationCommand(BaseModel):
 
     type: Literal["finish_calibration"] = "finish_calibration"
     horizontal_mm: float | None = None
+
+
+class DetectGridCommand(BaseModel):
+    """Trigger one-shot mat-grid detection on the next camera frame.
+
+    Runs the detector independently of ArUco markers: the full camera frame is
+    used as the ROI and the ArUco axis-alignment check is skipped. Result is
+    broadcast as a MatGridDetectedEvent.
+    """
+
+    type: Literal["detect_grid"] = "detect_grid"
 
 
 class SetWorkSurfaceCommand(BaseModel):
@@ -237,11 +338,26 @@ class SetCameraCommand(BaseModel):
     index: int | None
 
 
+class SetCameraRoiCommand(BaseModel):
+    """Set or clear the manual camera-frame ROI polygon.
+
+    When `clear=True`, the manual ROI is removed and grid detection falls
+    back to the work-surface-derived quad. When `clear=False` (default),
+    `corners` defines a 4-point polygon in cam_px (TL/TR/BR/BL order).
+    """
+
+    type: Literal["set_camera_roi"] = "set_camera_roi"
+    corners: list[list[float]] = Field(default_factory=list)
+    clear: bool = False
+
+
 ClientCommand = Union[
     SetModeCommand,
     RegisterProjectorCommand,
     StartCalibrationCommand,
     FinishCalibrationCommand,
+    DetectGridCommand,
     SetWorkSurfaceCommand,
     SetCameraCommand,
+    SetCameraRoiCommand,
 ]

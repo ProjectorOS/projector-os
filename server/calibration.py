@@ -27,7 +27,7 @@ import json
 import logging
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -232,8 +232,96 @@ MAT_GRID_IMPERIAL_SUBDIVISIONS = {2, 4, 8, 16}  # ½, ¼, ⅛, ⅟₁₆ inch
 MAT_GRID_MIN_LINES_PER_AXIS = 4
 MAT_GRID_PITCH_CV_MAX = 0.10  # max coefficient-of-variation on major-line spacing
 MAT_GRID_AXIS_TOLERANCE_RAD = math.radians(5.0)  # grid axis vs ArUco TL→TR
+# Half-window for classifying a strong line as belonging to an axis vs being a
+# diagonal. Wider than the ArUco-alignment tolerance because real-world camera
+# distortion + mat skew can rotate individual grid lines several degrees off
+# the global axis even when the axis itself is well-defined.
+MAT_GRID_LINE_AXIS_TOLERANCE_RAD = math.radians(10.0)
 MAT_GRID_SNAP_TOLERANCE_MM = 1.0
 MAT_GRID_CONFIDENCE_MIN = 0.7
+
+
+def _empty_segments() -> np.ndarray:
+    """An (N=0, 4) array — same shape Hough returns for line endpoints."""
+    return np.zeros((0, 4), dtype=np.float64)
+
+
+@dataclass
+class GridPreprocessing:
+    """Output of `preprocess_for_grid_detection` — the intermediate images
+    the detector sees, exposed for the processed-frame preview."""
+
+    gray_full: np.ndarray  # (H, W) uint8, green-suppressed grayscale of the whole frame
+    clahe_roi: np.ndarray  # (h, w) uint8, CLAHE'd ROI used for edge detection
+    edges_roi: np.ndarray  # (h, w) uint8, Canny edge map of the ROI
+    roi_origin: np.ndarray  # (2,) float64, top-left of the ROI in cam_px
+
+
+def preprocess_for_grid_detection(
+    frame: np.ndarray, roi_quad_cam: np.ndarray | None = None
+) -> GridPreprocessing | None:
+    """Run the same preprocessing chain `detect_mat_grid` uses: green-
+    suppressing grayscale → optional ROI crop → CLAHE → Gaussian blur →
+    Canny. Returns `None` when the ROI quad is too small to crop, mirroring
+    the detector's early-out so the caller can skip visualization in lockstep.
+
+    The crop is the *exact* bounding box of `roi_quad_cam` — when the user
+    selects a manual camera ROI we honor it edge-to-edge instead of
+    shrinking it. ArUco/dot markers don't produce strong-Hough-class lines
+    at typical camera resolutions, so leaving them in the ROI is fine.
+    """
+    # Color cutting mats (typically dark green or dark blue) are low-contrast
+    # in standard luminance grayscale: cvtColor BGR→GRAY weights green ~60 %,
+    # which makes a green mat *brighter* than the printed gray lines and
+    # collapses the line/background contrast. Using (R + B) / 2 instead
+    # suppresses the dominant-color background on green and blue mats while
+    # keeping achromatic gray lines bright. For non-color mats this is just a
+    # different luminance estimator with similar behavior.
+    if frame.ndim == 3:
+        b, _g, r = cv2.split(frame)
+        gray = ((b.astype(np.uint16) + r.astype(np.uint16)) // 2).astype(np.uint8)
+    else:
+        gray = frame.copy()
+
+    if roi_quad_cam is not None and roi_quad_cam.shape == (4, 2):
+        x0 = float(np.min(roi_quad_cam[:, 0]))
+        x1 = float(np.max(roi_quad_cam[:, 0]))
+        y0 = float(np.min(roi_quad_cam[:, 1]))
+        y1 = float(np.max(roi_quad_cam[:, 1]))
+        x0i = int(max(0, math.floor(x0)))
+        y0i = int(max(0, math.floor(y0)))
+        x1i = int(min(gray.shape[1], math.ceil(x1)))
+        y1i = int(min(gray.shape[0], math.ceil(y1)))
+        if x1i - x0i < 50 or y1i - y0i < 50:
+            return None
+        roi = gray[y0i:y1i, x0i:x1i].copy()
+        roi_origin = np.array([x0i, y0i], dtype=np.float64)
+    else:
+        roi = gray.copy()
+        roi_origin = np.array([0.0, 0.0], dtype=np.float64)
+
+    # CLAHE locally equalizes contrast inside the work-surface ROI so the
+    # subtle gray-on-green grid lines produce strong-enough Canny edges to
+    # pass the strict Hough threshold. clipLimit=3 / 8×8 tiles is a standard
+    # recipe — aggressive enough to recover faint majors, conservative
+    # enough not to amplify camera noise into spurious edges.
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    clahe_roi = clahe.apply(roi)
+
+    blurred = cv2.GaussianBlur(clahe_roi, (3, 3), 0)
+    median = float(np.median(blurred))
+    lower = int(max(0, 0.66 * median))
+    upper = int(min(255, 1.33 * median))
+    if upper <= lower:
+        upper = lower + 1
+    edges = cv2.Canny(blurred, lower, upper)
+
+    return GridPreprocessing(
+        gray_full=gray,
+        clahe_roi=clahe_roi,
+        edges_roi=edges,
+        roi_origin=roi_origin,
+    )
 
 
 @dataclass
@@ -242,6 +330,12 @@ class MatGridCapture:
 
     `intersections_cam` is the (N, 2) array of major-line intersection points in
     camera pixels, used as correspondences for the refined homography fit.
+
+    The `*_lines_cam` fields are diagnostic snapshots from the pipeline: every
+    early-return path populates whatever it computed before bailing, so the UI
+    can render an "explain what the detector saw" overlay regardless of whether
+    classification ultimately succeeded. Each entry is a 4-tuple
+    `[x1, y1, x2, y2]` line segment in camera pixels.
     """
 
     detected: bool
@@ -255,6 +349,22 @@ class MatGridCapture:
     major_pitch_mm: float
     confidence: float
     reason: str | None = None
+    # Diagnostic line sets in cam-pixel coordinates. weak ⊇ strong;
+    # axis_a_lines_cam ∪ axis_b_lines_cam ∪ diagonal_lines_cam ⊆ strong_lines_cam.
+    # `diagonal_lines_cam` is the set of strong lines that *aren't* aligned
+    # with either grid axis — typically the 30° / 45° / 60° angle guides
+    # printed on most cutting mats. The detector explicitly rejects them
+    # for axis selection, but they're useful to surface visually so the
+    # user can see "we did see those lines, we just didn't use them".
+    weak_lines_cam: np.ndarray = field(default_factory=_empty_segments)
+    strong_lines_cam: np.ndarray = field(default_factory=_empty_segments)
+    axis_a_lines_cam: np.ndarray = field(default_factory=_empty_segments)
+    axis_b_lines_cam: np.ndarray = field(default_factory=_empty_segments)
+    diagonal_lines_cam: np.ndarray = field(default_factory=_empty_segments)
+    # Intermediate preprocessing images (green-suppressed gray, CLAHE'd ROI,
+    # Canny edges) so the processed-frame preview can show what the detector
+    # actually consumed. Not serialized over the wire.
+    preprocessing: "GridPreprocessing | None" = None
 
     @classmethod
     def failure(cls, reason: str) -> "MatGridCapture":
@@ -355,9 +465,14 @@ def _modal_pitch(values: list[float]) -> tuple[float, float]:
 def _detect_grid_axes(strong_lines: np.ndarray) -> tuple[float, float] | None:
     """Find two perpendicular dominant orientations from the strong-line set.
 
-    The mat's grid lines live in two perpendicular families at some unknown
-    rotation θ. We histogram the line angles and look for the global max plus
-    a second peak ~90° away.
+    Cutting mats often print diagonal angle guides (30°, 45°, 60°) alongside
+    the main grid. Picking the global histogram max as the primary axis can
+    therefore land on a diagonal when the grid axes themselves have similar
+    or fewer line votes. We instead pick the *perpendicular pair* with the
+    highest combined support: the grid produces many parallel lines on both
+    of two perpendicular axes, while diagonal angle guides typically appear
+    as a few lines without a strong perpendicular partner. This naturally
+    skips the diagonals in favor of the actual grid.
     """
     if strong_lines is None or len(strong_lines) < 2 * MAT_GRID_MIN_LINES_PER_AXIS:
         return None
@@ -370,18 +485,35 @@ def _detect_grid_axes(strong_lines: np.ndarray) -> tuple[float, float] | None:
     if hist_s.max() < MAT_GRID_MIN_LINES_PER_AXIS:
         return None
 
-    idx_a = int(np.argmax(hist_s))
+    band = max(1, nbins // 18)  # ±5° tolerance around the perpendicular bin
+    perp_offset = nbins // 2  # nbins=90 covers 0..π so perp = +π/2 = +45 bins
+    best_score = -1.0
+    best_pair: tuple[int, int] | None = None
+    for i in range(nbins):
+        if hist_s[i] < MAT_GRID_MIN_LINES_PER_AXIS:
+            continue
+        # Find the strongest bin within ±band of the perpendicular direction.
+        j_center = (i + perp_offset) % nbins
+        best_j = j_center
+        best_j_score = -1.0
+        for dj in range(-band, band + 1):
+            j = (j_center + dj) % nbins
+            if hist_s[j] > best_j_score:
+                best_j_score = hist_s[j]
+                best_j = j
+        if best_j_score < MAT_GRID_MIN_LINES_PER_AXIS:
+            continue
+        score = float(hist_s[i] + best_j_score)
+        if score > best_score:
+            best_score = score
+            best_pair = (i, best_j)
+    if best_pair is None:
+        return None
+    idx_a, idx_b = best_pair
+    # Convention: axis A is the orientation with more line support.
+    if hist_s[idx_a] < hist_s[idx_b]:
+        idx_a, idx_b = idx_b, idx_a
     angle_a = (idx_a + 0.5) * (math.pi / nbins)
-    perp = (angle_a + math.pi / 2.0) % math.pi
-    idx_perp = int(perp / (math.pi / nbins))
-    band = max(1, nbins // 18)  # ±5° around perp
-    lo = max(0, idx_perp - band)
-    hi = min(nbins, idx_perp + band + 1)
-    if hi <= lo:
-        return None
-    idx_b = lo + int(np.argmax(hist_s[lo:hi]))
-    if hist_s[idx_b] < MAT_GRID_MIN_LINES_PER_AXIS:
-        return None
     angle_b = (idx_b + 0.5) * (math.pi / nbins)
     return angle_a, angle_b
 
@@ -394,6 +526,30 @@ def _lines_for_axis(
     out: list[np.ndarray] = []
     for l in lines:
         if _angle_diff_rad(_line_angle(l), axis_angle_rad) <= tolerance_rad:
+            out.append(l)
+    if not out:
+        return np.zeros((0, 4), dtype=np.float64)
+    return np.array(out, dtype=np.float64)
+
+
+def _lines_off_axes(
+    lines: np.ndarray,
+    angle_a: float,
+    angle_b: float,
+    tolerance_rad: float,
+) -> np.ndarray:
+    """Return strong lines that align with *neither* grid axis. These are the
+    cutting-mat angle guides (typically 30°, 45°, 60°) we want to show in the
+    diagnostic overlay but exclude from axis selection / pitch detection."""
+    if lines is None or len(lines) == 0:
+        return np.zeros((0, 4), dtype=np.float64)
+    out: list[np.ndarray] = []
+    for l in lines:
+        ang = _line_angle(l)
+        if (
+            _angle_diff_rad(ang, angle_a) > tolerance_rad
+            and _angle_diff_rad(ang, angle_b) > tolerance_rad
+        ):
             out.append(l)
     if not out:
         return np.zeros((0, 4), dtype=np.float64)
@@ -477,12 +633,14 @@ def _classify_grid_system(n_x: int, n_y: int) -> tuple[str, float, int] | None:
 
 
 def detect_mat_grid(
-    frame: np.ndarray, aruco_quad_cam: np.ndarray | None = None
+    frame: np.ndarray, roi_quad_cam: np.ndarray | None = None
 ) -> MatGridCapture:
     """Detect a printed cutting-mat grid in the camera frame.
 
-    `aruco_quad_cam` (optional, shape (4, 2)): the four ArUco-marker centers in
-    cam_px in TL/TR/BR/BL order. When supplied:
+    `roi_quad_cam` (optional, shape (4, 2)): four cam_px points in TL/TR/BR/BL
+    order delimiting the work surface — typically the 4 ArUco marker centers
+    (ArUco method) or the 4 projected dot centers (grid-only method). When
+    supplied:
       - the search is restricted to the bounding box of the quad
       - the dominant grid axis is sanity-checked against the TL→TR direction
         (catches mis-detection of wood grain, tile, paper rules, etc.)
@@ -494,39 +652,11 @@ def detect_mat_grid(
     if frame is None or frame.size == 0:
         return MatGridCapture.failure("empty frame")
 
-    if frame.ndim == 3:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = frame
-
-    # Crop to the ArUco bounding box, with a small inward margin so we don't
-    # latch onto the markers themselves.
-    if aruco_quad_cam is not None and aruco_quad_cam.shape == (4, 2):
-        x0 = float(np.min(aruco_quad_cam[:, 0]))
-        x1 = float(np.max(aruco_quad_cam[:, 0]))
-        y0 = float(np.min(aruco_quad_cam[:, 1]))
-        y1 = float(np.max(aruco_quad_cam[:, 1]))
-        inset = 0.05 * min(x1 - x0, y1 - y0)
-        x0i = int(max(0, math.floor(x0 + inset)))
-        y0i = int(max(0, math.floor(y0 + inset)))
-        x1i = int(min(gray.shape[1], math.ceil(x1 - inset)))
-        y1i = int(min(gray.shape[0], math.ceil(y1 - inset)))
-        if x1i - x0i < 50 or y1i - y0i < 50:
-            return MatGridCapture.failure("ArUco quad too small to crop")
-        roi = gray[y0i:y1i, x0i:x1i]
-        roi_origin = np.array([x0i, y0i], dtype=np.float64)
-    else:
-        roi = gray
-        roi_origin = np.array([0.0, 0.0], dtype=np.float64)
-
-    # Light blur to suppress sub-pixel speckle without erasing thin grid lines.
-    blurred = cv2.GaussianBlur(roi, (3, 3), 0)
-    median = float(np.median(blurred))
-    lower = int(max(0, 0.66 * median))
-    upper = int(min(255, 1.33 * median))
-    if upper <= lower:
-        upper = lower + 1
-    edges = cv2.Canny(blurred, lower, upper)
+    pre = preprocess_for_grid_detection(frame, roi_quad_cam)
+    if pre is None:
+        cap = MatGridCapture.failure("work-surface quad too small to crop")
+        return cap
+    roi, edges, roi_origin = pre.clahe_roi, pre.edges_roi, pre.roi_origin
 
     h, w = roi.shape[:2]
     min_dim = min(h, w)
@@ -550,31 +680,65 @@ def detect_mat_grid(
         minLineLength=int(min_dim * 0.1),
         maxLineGap=int(min_dim * 0.05),
     )
-    if strong_segments is None or weak_segments is None:
-        return MatGridCapture.failure("not enough lines detected")
-    strong = strong_segments.reshape(-1, 4).astype(np.float64)
-    weak = weak_segments.reshape(-1, 4).astype(np.float64)
+    # Hough returns None when *no* lines were found in that pass; we coerce to
+    # an empty (0, 4) array so the diagnostic surface always has the same
+    # shape and the UI can read "weak: N, strong: N" from the response even
+    # when one or both passes found nothing.
+    strong = (
+        strong_segments.reshape(-1, 4).astype(np.float64)
+        if strong_segments is not None
+        else np.zeros((0, 4), dtype=np.float64)
+    )
+    weak = (
+        weak_segments.reshape(-1, 4).astype(np.float64)
+        if weak_segments is not None
+        else np.zeros((0, 4), dtype=np.float64)
+    )
     # Translate ROI coordinates back to full-frame coordinates.
-    strong[:, [0, 2]] += roi_origin[0]
-    strong[:, [1, 3]] += roi_origin[1]
-    weak[:, [0, 2]] += roi_origin[0]
-    weak[:, [1, 3]] += roi_origin[1]
+    if strong.shape[0]:
+        strong[:, [0, 2]] += roi_origin[0]
+        strong[:, [1, 3]] += roi_origin[1]
+    if weak.shape[0]:
+        weak[:, [0, 2]] += roi_origin[0]
+        weak[:, [1, 3]] += roi_origin[1]
+
+    # `out` is built incrementally so any early-return preserves the partial
+    # diagnostic state (which lines did we see, did we find axes, etc.) for
+    # the camera-preview overlay. Each pipeline step writes to it just before
+    # the corresponding gate.
+    out = MatGridCapture.failure("unknown")
+    out.preprocessing = pre
+    out.weak_lines_cam = weak
+    out.strong_lines_cam = strong
+
+    if strong.shape[0] == 0 and weak.shape[0] == 0:
+        out.reason = "not enough lines detected"
+        return out
 
     axes = _detect_grid_axes(strong)
     if axes is None:
-        return MatGridCapture.failure("grid axes not separable")
+        out.reason = "grid axes not separable"
+        return out
     angle_a, angle_b = axes
+    out.axis_x_angle_rad = angle_a
+    out.axis_y_angle_rad = angle_b
 
-    strong_a = _lines_for_axis(strong, angle_a, tolerance_rad=math.radians(5))
-    strong_b = _lines_for_axis(strong, angle_b, tolerance_rad=math.radians(5))
-    weak_a = _lines_for_axis(weak, angle_a, tolerance_rad=math.radians(5))
-    weak_b = _lines_for_axis(weak, angle_b, tolerance_rad=math.radians(5))
+    strong_a = _lines_for_axis(strong, angle_a, tolerance_rad=MAT_GRID_LINE_AXIS_TOLERANCE_RAD)
+    strong_b = _lines_for_axis(strong, angle_b, tolerance_rad=MAT_GRID_LINE_AXIS_TOLERANCE_RAD)
+    weak_a = _lines_for_axis(weak, angle_a, tolerance_rad=MAT_GRID_LINE_AXIS_TOLERANCE_RAD)
+    weak_b = _lines_for_axis(weak, angle_b, tolerance_rad=MAT_GRID_LINE_AXIS_TOLERANCE_RAD)
+    out.axis_a_lines_cam = strong_a
+    out.axis_b_lines_cam = strong_b
+    out.diagonal_lines_cam = _lines_off_axes(
+        strong, angle_a, angle_b, tolerance_rad=MAT_GRID_LINE_AXIS_TOLERANCE_RAD
+    )
 
     if (
         len(strong_a) < MAT_GRID_MIN_LINES_PER_AXIS
         or len(strong_b) < MAT_GRID_MIN_LINES_PER_AXIS
     ):
-        return MatGridCapture.failure("too few major lines")
+        out.reason = "too few major lines"
+        return out
 
     d_strong_a = np.array([_line_normal_distance(l, angle_a) for l in strong_a])
     d_strong_b = np.array([_line_normal_distance(l, angle_b) for l in strong_b])
@@ -584,9 +748,13 @@ def detect_mat_grid(
     pitch_a, cv_a = _modal_pitch(d_strong_a.tolist())
     pitch_b, cv_b = _modal_pitch(d_strong_b.tolist())
     if pitch_a <= 0 or pitch_b <= 0:
-        return MatGridCapture.failure("major-line pitch undetermined")
+        out.reason = "major-line pitch undetermined"
+        return out
     if cv_a > MAT_GRID_PITCH_CV_MAX or cv_b > MAT_GRID_PITCH_CV_MAX:
-        return MatGridCapture.failure("major-line pitch too irregular")
+        out.reason = "major-line pitch too irregular"
+        return out
+    out.pitch_cam_px_x = pitch_a
+    out.pitch_cam_px_y = pitch_b
 
     # Tolerance for "is this minor line the same as that major line" = 25 % of
     # the major pitch. Within that band we treat a weak detection as a duplicate
@@ -595,40 +763,48 @@ def detect_mat_grid(
     n_y = _count_subdivisions(d_strong_b, d_weak_b, tolerance=0.25 * pitch_b)
     classification = _classify_grid_system(n_x, n_y)
     if classification is None:
-        return MatGridCapture.failure(
+        out.reason = (
             f"subdivision count ({n_x}, {n_y}) is neither metric nor imperial"
         )
+        return out
     grid_system, major_pitch_mm, subdivisions = classification
 
     # Sanity check: at least one detected axis must align with TL→TR. Swap if
     # axis B is the closer match — we want axis A to be the mat's X axis.
-    if aruco_quad_cam is not None:
-        tl, tr = aruco_quad_cam[0], aruco_quad_cam[1]
-        aruco_x_angle = math.atan2(float(tr[1] - tl[1]), float(tr[0] - tl[0]))
-        if aruco_x_angle < 0:
-            aruco_x_angle += math.pi
-        diff_a = _angle_diff_rad(angle_a, aruco_x_angle)
-        diff_b = _angle_diff_rad(angle_b, aruco_x_angle)
+    if roi_quad_cam is not None:
+        tl, tr = roi_quad_cam[0], roi_quad_cam[1]
+        ref_x_angle = math.atan2(float(tr[1] - tl[1]), float(tr[0] - tl[0]))
+        if ref_x_angle < 0:
+            ref_x_angle += math.pi
+        diff_a = _angle_diff_rad(angle_a, ref_x_angle)
+        diff_b = _angle_diff_rad(angle_b, ref_x_angle)
         if (
             diff_a > MAT_GRID_AXIS_TOLERANCE_RAD
             and diff_b > MAT_GRID_AXIS_TOLERANCE_RAD
         ):
-            return MatGridCapture.failure("grid axes not aligned with ArUco quad")
+            out.reason = "grid axes not aligned with work-surface quad"
+            return out
         if diff_b < diff_a:
             angle_a, angle_b = angle_b, angle_a
             strong_a, strong_b = strong_b, strong_a
             pitch_a, pitch_b = pitch_b, pitch_a
+            out.axis_x_angle_rad = angle_a
+            out.axis_y_angle_rad = angle_b
+            out.axis_a_lines_cam = strong_a
+            out.axis_b_lines_cam = strong_b
+            out.pitch_cam_px_x = pitch_a
+            out.pitch_cam_px_y = pitch_b
 
     # Compute intersections of major lines (axis-A × axis-B) and keep only
-    # those inside the ArUco quad's bounding box.
-    if aruco_quad_cam is not None:
-        x0_b = float(np.min(aruco_quad_cam[:, 0]))
-        x1_b = float(np.max(aruco_quad_cam[:, 0]))
-        y0_b = float(np.min(aruco_quad_cam[:, 1]))
-        y1_b = float(np.max(aruco_quad_cam[:, 1]))
+    # those inside the work-surface quad's bounding box.
+    if roi_quad_cam is not None:
+        x0_b = float(np.min(roi_quad_cam[:, 0]))
+        x1_b = float(np.max(roi_quad_cam[:, 0]))
+        y0_b = float(np.min(roi_quad_cam[:, 1]))
+        y1_b = float(np.max(roi_quad_cam[:, 1]))
     else:
         x0_b, y0_b = 0.0, 0.0
-        x1_b, y1_b = float(gray.shape[1]), float(gray.shape[0])
+        x1_b, y1_b = float(frame.shape[1]), float(frame.shape[0])
     intersections: list[tuple[float, float]] = []
     for la in strong_a:
         for lb in strong_b:
@@ -638,8 +814,10 @@ def detect_mat_grid(
             px, py = p
             if x0_b <= px <= x1_b and y0_b <= py <= y1_b:
                 intersections.append((px, py))
+    out.intersections_cam = np.array(intersections, dtype=np.float64).reshape(-1, 2)
     if len(intersections) < 4:
-        return MatGridCapture.failure("too few major-line intersections")
+        out.reason = "too few major-line intersections"
+        return out
 
     # Confidence: combine line counts (more = better), pitch CVs (lower =
     # better), and the strict (n_x == n_y) check that we already passed.
@@ -648,18 +826,278 @@ def detect_mat_grid(
     subdivision_score = 1.0
     confidence = float(0.5 * line_score + 0.3 * pitch_score + 0.2 * subdivision_score)
 
-    return MatGridCapture(
-        detected=True,
-        intersections_cam=np.array(intersections, dtype=np.float64),
-        pitch_cam_px_x=pitch_a,
-        pitch_cam_px_y=pitch_b,
-        axis_x_angle_rad=angle_a,
-        axis_y_angle_rad=angle_b,
-        subdivisions_per_major=subdivisions,
-        grid_system=grid_system,
-        major_pitch_mm=major_pitch_mm,
-        confidence=confidence,
-        reason=None,
+    out.detected = True
+    out.subdivisions_per_major = subdivisions
+    out.grid_system = grid_system
+    out.major_pitch_mm = major_pitch_mm
+    out.confidence = confidence
+    out.reason = None
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Calibration-dot detection (used by the grid-only calibration method)
+# ---------------------------------------------------------------------------
+#
+# In grid-only mode the projector draws 4 plain solid white dots at the work-
+# surface corners. The camera finds them as the 4 brightest, roughly-circular
+# blobs in the frame. Unlike ArUco, the dots carry no embedded identity — we
+# disambiguate TL/TR/BR/BL purely by their 2-D positions in the camera frame.
+
+CALIBRATION_DOT_BRIGHTNESS_THRESHOLD = 200  # 0..255; very bright pixels only
+CALIBRATION_DOT_MIN_AREA_PX = 50
+CALIBRATION_DOT_MAX_AREA_PX = 50000
+CALIBRATION_DOT_MIN_FILL = 0.4  # area / bbox-area; rejects elongated streaks
+CALIBRATION_DOT_MAX_ASPECT = 2.0
+
+
+def detect_calibration_dots(frame: np.ndarray) -> tuple[list[np.ndarray], int]:
+    """Locate up to 4 bright dots in the camera frame.
+
+    Returns `(sorted_dots, candidate_count)`:
+      - `candidate_count` is the number of bright-blob candidates found, useful
+        for progress UI ("2/4 dots visible") even before all 4 are present.
+      - `sorted_dots` is a 4-element list of `(x, y)` cam_px centers in
+        TL/TR/BR/BL order **only when exactly 4 candidates are present**;
+        otherwise it's empty (we can't tell which corner is missing from a
+        partial set without a prior projector→camera mapping).
+
+    The detector assumes the projector dots are the brightest things in the
+    scene — true on a dark mat under typical room lighting. On overlit
+    workspaces this will pick up other bright objects; that's a documented
+    limitation, dim the room or close the blinds.
+    """
+    if frame is None or frame.size == 0:
+        return ([], 0)
+    if frame.ndim == 3:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = frame
+    _, binary = cv2.threshold(
+        gray, CALIBRATION_DOT_BRIGHTNESS_THRESHOLD, 255, cv2.THRESH_BINARY
+    )
+    # Close small gaps so the detector doesn't fragment a single dot into
+    # multiple components (cheap glare / sub-pixel halo cleanup).
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+    num_labels, _labels, stats, centroids = cv2.connectedComponentsWithStats(
+        binary, connectivity=8
+    )
+    candidates: list[tuple[int, float, float]] = []  # (area, cx, cy)
+    for i in range(1, num_labels):  # 0 = background
+        x, y, w, h, area = (
+            int(stats[i, cv2.CC_STAT_LEFT]),
+            int(stats[i, cv2.CC_STAT_TOP]),
+            int(stats[i, cv2.CC_STAT_WIDTH]),
+            int(stats[i, cv2.CC_STAT_HEIGHT]),
+            int(stats[i, cv2.CC_STAT_AREA]),
+        )
+        if area < CALIBRATION_DOT_MIN_AREA_PX or area > CALIBRATION_DOT_MAX_AREA_PX:
+            continue
+        if max(w, h) / max(1, min(w, h)) > CALIBRATION_DOT_MAX_ASPECT:
+            continue
+        if area / max(1, w * h) < CALIBRATION_DOT_MIN_FILL:
+            continue
+        cx, cy = float(centroids[i, 0]), float(centroids[i, 1])
+        candidates.append((area, cx, cy))
+
+    candidates.sort(key=lambda c: -c[0])  # largest first
+    top = candidates[:4]
+    count = len(top)
+    if count != 4:
+        return ([], count)
+
+    # Assign TL/TR/BR/BL by position. Sort by Y first (top half vs bottom
+    # half), then by X within each half. This works reliably as long as the
+    # camera is roughly upright relative to the projection — same assumption
+    # the existing ArUco layout makes.
+    pts = [(cx, cy) for _, cx, cy in top]
+    pts.sort(key=lambda p: p[1])
+    top_two = sorted(pts[:2], key=lambda p: p[0])    # TL, TR
+    bottom_two = sorted(pts[2:], key=lambda p: p[0]) # BL, BR
+    sorted_dots = [
+        np.array(top_two[0], dtype=np.float64),     # TL
+        np.array(top_two[1], dtype=np.float64),     # TR
+        np.array(bottom_two[1], dtype=np.float64),  # BR
+        np.array(bottom_two[0], dtype=np.float64),  # BL
+    ]
+    return (sorted_dots, count)
+
+
+def compute_grid_homography(grid_capture: MatGridCapture) -> np.ndarray | None:
+    """Compute H_cam_to_mat from grid detection alone — no projector dots
+    required. Mat-mm origin is arbitrary (one of the detected intersections);
+    callers that need a fixed origin (e.g. TL anchor) compose a translation.
+
+    Used by both the full grid-only calibration flow and the rectified-frame
+    preview (which warps the camera image into mat space so the user can see
+    the grid drawn straight, with camera keystone removed).
+    """
+    if not grid_capture.detected:
+        return None
+    if grid_capture.intersections_cam.shape[0] < 4:
+        return None
+    pitch_mm = grid_capture.major_pitch_mm
+    origin_cam = grid_capture.intersections_cam[0].astype(np.float64)
+    ux = np.array(
+        [
+            math.cos(grid_capture.axis_x_angle_rad) * grid_capture.pitch_cam_px_x,
+            math.sin(grid_capture.axis_x_angle_rad) * grid_capture.pitch_cam_px_x,
+        ],
+        dtype=np.float64,
+    )
+    uy = np.array(
+        [
+            math.cos(grid_capture.axis_y_angle_rad) * grid_capture.pitch_cam_px_y,
+            math.sin(grid_capture.axis_y_angle_rad) * grid_capture.pitch_cam_px_y,
+        ],
+        dtype=np.float64,
+    )
+    cam_basis = np.column_stack([ux, uy])
+    try:
+        cam_basis_inv = np.linalg.inv(cam_basis)
+    except np.linalg.LinAlgError:
+        return None
+    A = cam_basis_inv * pitch_mm
+    t = -A @ origin_cam
+    h_coarse = np.array(
+        [[A[0, 0], A[0, 1], t[0]],
+         [A[1, 0], A[1, 1], t[1]],
+         [0.0,     0.0,     1.0]],
+        dtype=np.float64,
+    )
+    inter_cam = grid_capture.intersections_cam.astype(np.float64).reshape(-1, 1, 2)
+    inter_mat = cv2.perspectiveTransform(inter_cam, h_coarse).reshape(-1, 2)
+    snapped = np.round(inter_mat / pitch_mm) * pitch_mm
+    residuals = np.linalg.norm(inter_mat - snapped, axis=1)
+    keep = residuals <= MAT_GRID_SNAP_TOLERANCE_MM
+    if int(keep.sum()) < 8:
+        return None
+    cam_kept = grid_capture.intersections_cam[keep].astype(np.float32)
+    mat_kept = snapped[keep].astype(np.float32)
+    h_cam_to_mat, _ = cv2.findHomography(
+        cam_kept, mat_kept, method=cv2.RANSAC, ransacReprojThreshold=1.0
+    )
+    return h_cam_to_mat
+
+
+def compute_grid_only_calibration(
+    dots_cam: list[np.ndarray],
+    grid_capture: MatGridCapture,
+    layout: list[CalibrationMarker],
+    proj_w: int,
+    proj_h: int,
+) -> Calibration:
+    """Compute calibration from 4 projected dots + a detected cutting-mat grid.
+
+    No ArUco markers are used. The grid alone provides camera↔mat (axes +
+    scale via grid pitch); the 4 dots provide projector↔mat (transform their
+    cam_px positions to mat_mm via H_cam_to_mat, then fit H_mat_to_proj from
+    the 4 known proj_px positions in the layout).
+
+    Mat-frame convention matches the ArUco path: TL dot at (0, 0), TR on the
+    positive X axis. Final mat_mm origin is anchored at the TL dot via a
+    translation composed onto the refined H_cam_to_mat.
+    """
+    if len(dots_cam) != 4:
+        raise RuntimeError(
+            f"expected 4 detected dots, got {len(dots_cam)} — cannot calibrate"
+        )
+    if not grid_capture.detected:
+        raise RuntimeError(
+            "grid_capture is not detected — cannot compute grid-only calibration"
+        )
+    if grid_capture.intersections_cam.shape[0] < 4:
+        raise RuntimeError("not enough grid intersections")
+
+    pitch_mm = grid_capture.major_pitch_mm
+
+    # Step 1: build a coarse H_cam_to_mat from the grid alone. The mat frame
+    # at this stage is anchored at the *first detected intersection* (origin
+    # is arbitrary and gets re-anchored at the TL dot in step 3). Axes and
+    # scale come from the grid's `axis_*_angle_rad` and `pitch_cam_px_*`.
+    origin_cam = grid_capture.intersections_cam[0].astype(np.float64)
+    angle_x = grid_capture.axis_x_angle_rad
+    angle_y = grid_capture.axis_y_angle_rad
+    ux = np.array(
+        [math.cos(angle_x) * grid_capture.pitch_cam_px_x,
+         math.sin(angle_x) * grid_capture.pitch_cam_px_x],
+        dtype=np.float64,
+    )
+    uy = np.array(
+        [math.cos(angle_y) * grid_capture.pitch_cam_px_y,
+         math.sin(angle_y) * grid_capture.pitch_cam_px_y],
+        dtype=np.float64,
+    )
+    cam_basis = np.column_stack([ux, uy])  # cam_dxy = cam_basis @ mat_lattice_dxy
+    cam_basis_inv = np.linalg.inv(cam_basis)
+    A = cam_basis_inv * pitch_mm  # cam_dxy → mat_mm_dxy
+    t = -A @ origin_cam
+    h_coarse = np.array(
+        [[A[0, 0], A[0, 1], t[0]],
+         [A[1, 0], A[1, 1], t[1]],
+         [0.0,     0.0,     1.0]],
+        dtype=np.float64,
+    )
+
+    # Step 2: snap intersections to the lattice and refit with RANSAC over
+    # many points (mirrors the passive-calibration logic).
+    inter_cam = grid_capture.intersections_cam.astype(np.float64).reshape(-1, 1, 2)
+    inter_mat = cv2.perspectiveTransform(inter_cam, h_coarse).reshape(-1, 2)
+    snapped = np.round(inter_mat / pitch_mm) * pitch_mm
+    residuals = np.linalg.norm(inter_mat - snapped, axis=1)
+    keep = residuals <= MAT_GRID_SNAP_TOLERANCE_MM
+    if int(keep.sum()) < 8:
+        raise RuntimeError("not enough grid intersections snap to the lattice")
+    cam_kept = grid_capture.intersections_cam[keep].astype(np.float32)
+    mat_kept = snapped[keep].astype(np.float32)
+    h_cam_to_mat, _ = cv2.findHomography(
+        cam_kept, mat_kept, method=cv2.RANSAC, ransacReprojThreshold=1.0
+    )
+    if h_cam_to_mat is None:
+        raise RuntimeError("findHomography (cam→mat) failed")
+
+    # Step 3: transform dot cam_px → mat_mm. TL dot becomes the new origin;
+    # compose a translation onto H_cam_to_mat so mat_mm coordinates start at
+    # (0, 0) at the TL dot, matching the ArUco path's convention.
+    dot_cam_arr = np.array(dots_cam, dtype=np.float64).reshape(-1, 1, 2)
+    dot_mat = cv2.perspectiveTransform(dot_cam_arr, h_cam_to_mat).reshape(-1, 2)
+    tl_mat = dot_mat[0].copy()
+    dot_mat_anchored = dot_mat - tl_mat
+    translation = np.array(
+        [[1.0, 0.0, -tl_mat[0]], [0.0, 1.0, -tl_mat[1]], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    h_cam_to_mat = translation @ h_cam_to_mat
+
+    # Step 4: fit H_mat_to_proj from the 4 (mat_mm, proj_px) correspondences.
+    layout_by_id = {m.marker_id: m for m in layout}
+    proj_pts = np.array(
+        [
+            [layout_by_id[mid].proj_x, layout_by_id[mid].proj_y]
+            for mid in CALIBRATION_MARKER_IDS  # TL=10, TR=11, BR=12, BL=13
+        ],
+        dtype=np.float32,
+    )
+    h_mat_to_proj, _ = cv2.findHomography(
+        dot_mat_anchored.astype(np.float32), proj_pts, method=0
+    )
+    if h_mat_to_proj is None:
+        raise RuntimeError("findHomography (mat→proj) failed")
+
+    # Width/height from TL→TR and TL→BL spans, matching the ArUco path.
+    mat_width_mm = float(np.linalg.norm(dot_mat_anchored[1] - dot_mat_anchored[0]))
+    mat_height_mm = float(np.linalg.norm(dot_mat_anchored[3] - dot_mat_anchored[0]))
+
+    return Calibration(
+        h_cam_to_mat=h_cam_to_mat.tolist(),
+        h_mat_to_proj=h_mat_to_proj.tolist(),
+        proj_width=proj_w,
+        proj_height=proj_h,
+        mat_width_mm=mat_width_mm,
+        mat_height_mm=mat_height_mm,
+        created_at=time.time(),
     )
 
 

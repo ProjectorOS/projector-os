@@ -78,6 +78,15 @@ export class SvgRenderer implements Renderer {
     return el;
   }
 
+  static circle(cx: number, cy: number, r: number, attrs: Record<string, string> = {}): SVGCircleElement {
+    const el = document.createElementNS(SVG_NS, "circle");
+    el.setAttribute("cx", String(cx));
+    el.setAttribute("cy", String(cy));
+    el.setAttribute("r", String(r));
+    for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+    return el;
+  }
+
   static line(x1: number, y1: number, x2: number, y2: number, attrs: Record<string, string> = {}): SVGLineElement {
     const el = document.createElementNS(SVG_NS, "line");
     el.setAttribute("x1", String(x1));

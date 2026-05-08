@@ -119,11 +119,44 @@
 
         <!-- View shown when a camera is open and the user isn't switching. -->
         <div data-role="camera-live" hidden>
+          <div class="cam-preview-row">
+            <!-- Cursor magnifier: a copy of the camera-preview MJPEG stream
+                 cropped via CSS. The container clips with overflow:hidden;
+                 the inner <img> is scaled and translated so the focus point
+                 lands at the container's center. Always visible while the
+                 camera is live — focus follows the cursor over the preview,
+                 snaps to the corner being dragged during ROI editing, and
+                 falls back to camera-frame center otherwise. -->
+            <div class="cam-magnifier" data-role="cam-magnifier" hidden>
+              <img data-role="cam-magnifier-img" alt="Magnified" />
+              <!-- Crosshair overlay. Drawn in JS so it can switch between a
+                   default green plus (cursor / center focus) and two cyan
+                   rays following the polygon edges that meet at the dragged
+                   corner. -->
+              <svg class="cam-magnifier-crosshair" data-role="cam-magnifier-crosshair"
+                   viewBox="0 0 100 100" preserveAspectRatio="none"
+                   xmlns="http://www.w3.org/2000/svg"></svg>
+            </div>
           <div class="calib-preview" data-role="cam-preview">
             <img data-role="cam-preview-img" alt="Camera preview" />
             <svg class="calib-overlay" data-role="marker-overlay"
                  preserveAspectRatio="xMidYMid meet"
                  xmlns="http://www.w3.org/2000/svg" hidden></svg>
+            <svg class="calib-overlay" data-role="grid-overlay"
+                 preserveAspectRatio="xMidYMid meet"
+                 xmlns="http://www.w3.org/2000/svg" hidden></svg>
+            <!-- Manual camera-ROI overlay: dim mask outside the rectangle,
+                 cyan outline + 4 draggable edges. Visible only during
+                 grid-method calibration; lets the user constrain detection
+                 to a specific area of the camera frame. preserveAspectRatio
+                 matches the <img>'s `object-fit: contain` so the overlay
+                 aligns pixel-for-pixel with the camera frame even when the
+                 container letterboxes. -->
+            <svg class="calib-overlay calib-overlay-interactive"
+                 data-role="camera-roi-overlay"
+                 preserveAspectRatio="xMidYMid meet"
+                 xmlns="http://www.w3.org/2000/svg" hidden></svg>
+          </div>
           </div>
           <div class="row">
             <span class="pill ok">Live</span>
@@ -163,7 +196,10 @@
         <h2>Mode</h2>
         <div class="row">
           <button data-role="mode-idle-btn">Idle</button>
-          <button class="primary" data-role="mode-calibrate-btn">Calibrate</button>
+          <button class="primary" data-role="mode-calibrate-aruco-btn"
+                  title="Project ArUco markers; finalize via ruler measurement (or auto-detected grid).">Calibrate (markers)</button>
+          <button class="primary" data-role="mode-calibrate-grid-btn"
+                  title="Project plain dots; rely on the cutting-mat's printed grid for scale. No markers, no ruler.">Calibrate (grid)</button>
           <button data-role="mode-track-btn">Track</button>
         </div>
         <div class="help" data-role="mode-help" hidden></div>
@@ -181,6 +217,30 @@
           above so the markers can be projected.
         </div>
         <div data-role="calib-body">
+          <!-- "What OpenCV sees" preview: dim grayscale outside the ROI, CLAHE'd
+               brightness inside the work-surface bounding box, Canny edges
+               painted in red, ROI quad outlined in cyan. Visible only during
+               grid-method calibration. -->
+          <div class="calib-preview" data-role="grid-debug-preview" hidden>
+            <img data-role="grid-debug-preview-img" alt="Grid detector view" />
+          </div>
+          <!-- Rectified preview: camera frame warped through H_cam_to_mat
+               from grid detection so the cutting-mat grid appears straight
+               (camera keystone removed). Cyan overlay = expected orthogonal
+               lattice — successful rectification has the warped grid sitting
+               directly under the overlay. -->
+          <div class="calib-preview" data-role="grid-rectified-preview" hidden>
+            <img data-role="grid-rectified-preview-img" alt="Grid-rectified view" />
+          </div>
+          <!-- Manual camera ROI controls (grid-method calibration only).
+               Drag the 4 cyan corners over the camera preview to align the
+               polygon with the actual mat boundary. The polygon both masks
+               outside-area pixels from every detector and provides keystone
+               correction (warps to a rectangle) for grid detection. -->
+          <div class="row" data-role="camera-roi-controls" hidden>
+            <span class="help" data-role="camera-roi-info">No camera ROI set — drag the 4 cyan corners on the preview to align the polygon with the mat boundary.</span>
+            <button type="button" data-role="camera-roi-reset-btn" hidden>Clear ROI</button>
+          </div>
           <div class="row" data-role="calib-status"></div>
           <!-- Mat-grid detection pill. Hidden until the server reports a
                classification (or a non-trivial reason). When a grid is
@@ -208,6 +268,20 @@
             </button>
           </div>
           <div class="measurement-hint" data-role="measurement-hint"></div>
+
+          <!-- Explicit grid detection: independent of ArUco markers. Runs the
+               mat-grid detector on the full camera frame and reports what it
+               sees, so the user can verify the detector works on their mat
+               separately from the regular ArUco-gated calibration flow.
+               Hidden in grid-method calibration since the grid already runs
+               continuously there. -->
+          <div class="grid-detect" data-role="grid-detect-block">
+            <div class="row">
+              <button type="button" data-role="detect-grid-btn">Detect grid</button>
+              <span class="help" data-role="detect-grid-help">Runs the mat-grid detector on the full frame, ignoring ArUco markers.</span>
+            </div>
+            <div class="row" data-role="explicit-grid-result" hidden></div>
+          </div>
         </div>
       </div>
 

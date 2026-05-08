@@ -7,7 +7,14 @@ import { HandOverlay } from "./hand-overlay";
 import { TrackedObjectOverlay } from "./overlay";
 import { HtmlRenderer } from "./render/html-renderer";
 import { SvgRenderer } from "./render/svg-renderer";
-import type { CalibrationMarker, Calibration, Mode, ServerEvent, WorkSurface } from "../types";
+import type {
+  Calibration,
+  CalibrationMarker,
+  CalibrationMethod,
+  Mode,
+  ServerEvent,
+  WorkSurface,
+} from "../types";
 import { WorkSurfaceOverlay } from "./work-surface-overlay";
 import { defaultServerHttpUrl, defaultServerWsUrl, WsClient } from "../ws-client";
 
@@ -20,6 +27,7 @@ class ProjectorApp {
   // mat-grid detection state flips (and we want to drop the measurement guide).
   private calibrationMarkers: CalibrationMarker[] | null = null;
   private calibrationMarkerSizePx = 0;
+  private calibrationMethod: CalibrationMethod = "aruco";
   // Last-seen mat-grid detection flag from calibration_captured. We only
   // re-render the overlay when this transitions, not on every 6 Hz event.
   private gridDetected = false;
@@ -131,8 +139,14 @@ class ProjectorApp {
       case "calibration_prompt":
         this.calibrationMarkers = ev.markers;
         this.calibrationMarkerSizePx = ev.marker_size_px;
+        this.calibrationMethod = ev.method;
         this.gridDetected = false;
-        this.calibrationOverlay.show(ev.markers, ev.marker_size_px, true);
+        this.calibrationOverlay.show(
+          ev.markers,
+          ev.marker_size_px,
+          true,
+          ev.method,
+        );
         break;
       case "work_surface_updated":
         this.workSurface = ev.work_surface;
@@ -141,10 +155,12 @@ class ProjectorApp {
         this.refreshOverlay();
         break;
       case "calibration_captured": {
-        // Re-render the overlay only on a grid-detection flip — once the
-        // server confirms a reliable grid, we drop the "measure this" guide
-        // (the user no longer needs to ruler-measure anything). When the
-        // grid disappears we put the guide back.
+        // Grid method has no measurement guide regardless — skip the toggle.
+        if (this.calibrationMethod === "grid") break;
+        // ArUco method: re-render the overlay only on a grid-detection flip
+        // — once the server confirms a reliable grid, we drop the "measure
+        // this" guide (no ruler measurement needed). When the grid
+        // disappears we put the guide back.
         const detected = ev.mat_grid?.detected === true;
         if (
           detected !== this.gridDetected &&
@@ -156,6 +172,7 @@ class ProjectorApp {
             this.calibrationMarkers,
             this.calibrationMarkerSizePx,
             !detected,
+            this.calibrationMethod,
           );
         }
         break;
