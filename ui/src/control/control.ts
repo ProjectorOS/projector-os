@@ -9,7 +9,7 @@
 //   - mutates specific bits of text / classes / attributes in response to
 //     server events and user input
 
-import type { Calibration, DetectedObject, Mode, ServerEvent, WorkSurface } from "../types";
+import type { Calibration, CameraRoi, DetectedObject, Mode, ServerEvent, WorkSurface } from "../types";
 import { defaultServerHttpUrl, defaultServerWsUrl, WsClient } from "../ws-client";
 
 interface Display {
@@ -84,6 +84,11 @@ interface ViewState {
   cameraError: string | null;
   switchingCamera: boolean;
   frameStats: FrameStats | null;
+  cameraRoi: CameraRoi | null;
+  // Camera frame size, learned from the preview <img>'s naturalWidth/Height
+  // when it loads. Needed to scale drag interactions and to default the ROI
+  // to a sane initial rectangle when the user starts editing without one.
+  cameraFrame: { width: number; height: number } | null;
 }
 
 const SERVER_HTTP = defaultServerHttpUrl();
@@ -114,6 +119,8 @@ class ControlApp {
     cameraError: null,
     switchingCamera: false,
     frameStats: null,
+    cameraRoi: null,
+    cameraFrame: null,
   };
   private readonly ws: WsClient;
   // Whether the camera <img> currently has its MJPEG src attribute set. Used to avoid
@@ -128,6 +135,27 @@ class ControlApp {
   // When true, the camera card hides the preview, heartbeat, and frame-stats line.
   // The camera itself stays open server-side; this is purely a UI declutter toggle.
   private previewHidden = readBool("previewHidden", false);
+  // ROI editor toggle. When true, the polygon overlay + magnifier are
+  // mounted and the 4 corner handles are draggable. Persists per browser
+  // so the user's choice survives reload.
+  private roiEditMode = readBool("roiEditMode", false);
+  // Magnifier focus point in cam-pixel coords. Set from (in priority
+  // order) the corner currently being dragged → cursor position over the
+  // preview → camera-frame center as a fallback once dimensions are known.
+  // The magnifier stays visible whenever ROI edit mode is on; the focus
+  // point determines what's centered in the magnified view.
+  private magnifierFocus: { x: number; y: number } | null = null;
+  // Index of the ROI corner the magnifier is currently focused on (0=TL,
+  // 1=TR, 2=BR, 3=BL). Set when hovering over OR dragging a corner handle.
+  // Switches the magnifier crosshair from the default green plus to two
+  // cyan rays along the polygon edges meeting at that corner.
+  private magnifierCornerIdx: number | null = null;
+  // True while a corner drag is in progress. Lets the corner-drag handler
+  // own the magnifier focus across pointer moves without the cam-preview's
+  // hover-detect handler overwriting it (e.g. when the cursor briefly
+  // leaves the moving handle's hit area mid-drag).
+  private magnifierCornerDragActive = false;
+  private magnifierRaf: number | null = null;
 
   constructor() {
     this.ws = new WsClient({
@@ -219,6 +247,66 @@ class ControlApp {
     q("camera-preview-toggle-btn").addEventListener("click", () =>
       this.setPreviewHidden(!this.previewHidden),
     );
+    q("camera-roi-toggle-btn").addEventListener("click", () => {
+      this.roiEditMode = !this.roiEditMode;
+      writeBool("roiEditMode", this.roiEditMode);
+      // Entering edit mode on a hidden polygon would mean dragging handles
+      // you can't see — re-enable visibility on the way in.
+      const roi = this.state.cameraRoi;
+      if (
+        this.roiEditMode &&
+        roi !== null &&
+        roi.corners.length === 4 &&
+        !roi.enabled
+      ) {
+        this.ws.send({
+          type: "set_camera_roi",
+          corners: roi.corners,
+          enabled: true,
+        });
+      }
+      this.applyCameraCard();
+    });
+    q("camera-roi-reset-btn").addEventListener("click", () => {
+      this.ws.send({ type: "set_camera_roi", corners: [], clear: true });
+    });
+    q("camera-roi-visibility-btn").addEventListener("click", () => {
+      const roi = this.state.cameraRoi;
+      if (!roi || roi.corners.length !== 4) return;
+      // Hiding while editing forces edit mode off — there's no point
+      // dragging handles you can't see.
+      const next = !roi.enabled;
+      if (!next && this.roiEditMode) {
+        this.roiEditMode = false;
+        writeBool("roiEditMode", false);
+      }
+      this.ws.send({
+        type: "set_camera_roi",
+        corners: roi.corners,
+        enabled: next,
+      });
+    });
+    // Capture cam-frame natural size from the preview <img> as soon as it
+    // loads so the ROI overlay knows how to map between cam_px and CSS px.
+    const camImg = q<HTMLImageElement>("cam-preview-img");
+    camImg.addEventListener("load", () => {
+      const w = camImg.naturalWidth;
+      const h = camImg.naturalHeight;
+      if (w > 0 && h > 0) {
+        const prev = this.state.cameraFrame;
+        if (!prev || prev.width !== w || prev.height !== h) {
+          this.state.cameraFrame = { width: w, height: h };
+          this.updateCameraRoiOverlay();
+        }
+      }
+    });
+    // Cursor magnifier: pointer-move over the camera preview retargets the
+    // focus point. Cursor leaving doesn't hide the magnifier — focus stays
+    // at the last value until something else updates it.
+    const camPreview = q("cam-preview");
+    camPreview.addEventListener("pointermove", (ev) =>
+      this.handleMagnifierPointerMove(ev),
+    );
     q("camera-refresh-btn").addEventListener("click", () => void this.fetchCameras());
     q("camera-cancel-btn").addEventListener("click", () => {
       this.state.switchingCamera = false;
@@ -288,6 +376,7 @@ class ControlApp {
         this.state.showWorkSurfaceOutline = ev.show_work_surface_outline;
         this.state.cameraIndex = ev.camera_index;
         this.state.cameraOpen = ev.camera_open;
+        this.state.cameraRoi = ev.camera_roi;
         if (ev.calibration && !this.pendingMm) {
           this.pendingMm = formatMmForInput(ev.calibration.mat_width_mm);
           q<HTMLInputElement>("measurement-input").value = this.pendingMm;
@@ -337,6 +426,11 @@ class ControlApp {
         this.state.switchingCamera = false;
         this.applyCameraCard();
         this.applyCalibrationCard();
+        return;
+      case "camera_roi_updated":
+        this.state.cameraRoi = ev.camera_roi;
+        this.updateCameraRoiOverlay();
+        this.applyCameraRoiControls();
         return;
     }
   }
@@ -560,11 +654,42 @@ class ControlApp {
 
     const camPreview = q("cam-preview");
     camPreview.hidden = this.previewHidden;
+    q("cam-preview-row").hidden = this.previewHidden;
     q("heartbeat-row").hidden = this.previewHidden;
     q("camera-rotate-btn").hidden = this.previewHidden;
     q<HTMLButtonElement>("camera-preview-toggle-btn").textContent = this.previewHidden
       ? "Show preview"
       : "Close preview";
+
+    // ROI overlay visibility:
+    //   - polygon outline + dim mask: shown whenever a polygon is defined
+    //     and `enabled` is true (read-only outside edit mode);
+    //   - corner handles + magnifier: only shown in edit mode.
+    // The magnifier only "opens" (mounts the MJPEG stream + RAF loop) when
+    // edit mode is active — clicking "Edit ROI" is what brings up the
+    // cursor-zoom preview.
+    const roi = this.state.cameraRoi;
+    const roiVisible =
+      live &&
+      !this.previewHidden &&
+      (this.roiEditMode ||
+        (roi !== null && roi.corners.length === 4 && roi.enabled));
+    const editing = live && this.roiEditMode && !this.previewHidden;
+    if (editing) {
+      this.mountMagnifier();
+    } else {
+      this.unmountMagnifier();
+    }
+    q<SVGSVGElement>("camera-roi-overlay").toggleAttribute("hidden", !roiVisible);
+    q<HTMLButtonElement>("camera-roi-toggle-btn").classList.toggle(
+      "active",
+      this.roiEditMode,
+    );
+    q<HTMLButtonElement>("camera-roi-toggle-btn").textContent = this.roiEditMode
+      ? "Done editing ROI"
+      : "Edit ROI";
+    if (roiVisible) this.updateCameraRoiOverlay();
+    this.applyCameraRoiControls();
 
     const errorNode = q("camera-error");
     if (this.state.cameraError) {
@@ -996,6 +1121,457 @@ class ControlApp {
     this.pendingMm = "";
     q<HTMLInputElement>("measurement-input").value = "";
     this.refreshMeasurementHint();
+  }
+
+  // ─── Camera ROI editor ────────────────────────────────────────────────
+
+  private applyCameraRoiControls(): void {
+    // Buttons + helper text shown alongside the camera preview.
+    //   Edit ROI       — visible whenever the camera is live (toggles edit mode).
+    //   Hide / Show ROI — visible when a polygon is defined; toggles `enabled`.
+    //   Reset ROI      — visible when a polygon is defined.
+    //   Help line      — only in edit mode.
+    const live = this.state.cameraOpen && !this.previewHidden;
+    const roi = this.state.cameraRoi;
+    const hasPolygon = roi !== null && roi.corners.length === 4;
+    const editing = live && this.roiEditMode;
+    const info = q("camera-roi-info");
+    const reset = q<HTMLButtonElement>("camera-roi-reset-btn");
+    const visibility = q<HTMLButtonElement>("camera-roi-visibility-btn");
+    info.hidden = !editing;
+    reset.hidden = !(live && hasPolygon);
+    visibility.hidden = !(live && hasPolygon);
+    if (live && hasPolygon) {
+      const enabled = roi!.enabled;
+      visibility.textContent = enabled ? "Hide ROI" : "Show ROI";
+      visibility.title = enabled
+        ? "Hide the saved polygon (preserves corners; click again to show)."
+        : "Re-show the saved polygon.";
+    }
+    if (editing) {
+      info.textContent = hasPolygon
+        ? "Polygon set. Drag any cyan corner to refine."
+        : "Drag the 4 cyan corner handles on the preview to define the polygon.";
+    }
+  }
+
+  private mountMagnifier(): void {
+    q<HTMLDivElement>("cam-magnifier").hidden = false;
+    this.startMagnifierLoop();
+  }
+
+  private unmountMagnifier(): void {
+    q<HTMLDivElement>("cam-magnifier").hidden = true;
+    this.stopMagnifierLoop();
+  }
+
+  private handleMagnifierPointerMove(ev: PointerEvent): void {
+    if (!this.roiEditMode) return;
+    if (this.magnifierCornerDragActive) return;
+    // If the cursor is hovering over an ROI corner handle, snap focus to
+    // that corner's exact position and switch to corner-mode crosshair.
+    const target = ev.target as Element | null;
+    const handleAttr = target?.getAttribute?.("data-roi-handle") ?? null;
+    const corners = this.state.cameraRoi?.corners;
+    if (
+      handleAttr !== null &&
+      /^\d+$/.test(handleAttr) &&
+      corners &&
+      corners.length === 4
+    ) {
+      const idx = Number(handleAttr);
+      if (idx >= 0 && idx < 4) {
+        const c = corners[idx];
+        this.magnifierFocus = { x: c[0], y: c[1] };
+        this.magnifierCornerIdx = idx;
+        return;
+      }
+    }
+    const img = q<HTMLImageElement>("cam-preview-img");
+    if (!img.naturalWidth || !img.naturalHeight) return;
+    const rect = img.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    // The <img> uses object-fit: contain, so the rendered image may be
+    // letterboxed within its bounding box. Compute the actual rendered area
+    // first, then map the cursor into natural-image coordinates.
+    const naturalAspect = img.naturalWidth / img.naturalHeight;
+    const elAspect = rect.width / rect.height;
+    let renderedW: number, renderedH: number, offsetX: number, offsetY: number;
+    if (naturalAspect > elAspect) {
+      renderedW = rect.width;
+      renderedH = rect.width / naturalAspect;
+      offsetX = 0;
+      offsetY = (rect.height - renderedH) / 2;
+    } else {
+      renderedH = rect.height;
+      renderedW = rect.height * naturalAspect;
+      offsetY = 0;
+      offsetX = (rect.width - renderedW) / 2;
+    }
+    const lx = ev.clientX - rect.left - offsetX;
+    const ly = ev.clientY - rect.top - offsetY;
+    if (lx < 0 || ly < 0 || lx > renderedW || ly > renderedH) return;
+    this.magnifierFocus = {
+      x: (lx / renderedW) * img.naturalWidth,
+      y: (ly / renderedH) * img.naturalHeight,
+    };
+    this.magnifierCornerIdx = null;
+  }
+
+  private ensureMagnifierFocus(): void {
+    if (this.magnifierFocus !== null) return;
+    const img = q<HTMLImageElement>("cam-preview-img");
+    if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+      this.magnifierFocus = {
+        x: img.naturalWidth / 2,
+        y: img.naturalHeight / 2,
+      };
+    } else if (this.state.cameraFrame) {
+      this.magnifierFocus = {
+        x: this.state.cameraFrame.width / 2,
+        y: this.state.cameraFrame.height / 2,
+      };
+    }
+  }
+
+  private startMagnifierLoop(): void {
+    // Connect the magnifier <img> to the preview MJPEG stream. The browser
+    // opens its own connection per element — a small bandwidth hit on
+    // localhost — but the upside is no per-frame JS work: scaling + cropping
+    // are handled entirely by CSS transform + overflow:hidden on the
+    // container.
+    const magImg = q<HTMLImageElement>("cam-magnifier-img");
+    const desired = `${SERVER_HTTP}/camera/preview.mjpg`;
+    if (magImg.getAttribute("src") !== desired) {
+      magImg.src = desired;
+    }
+    if (this.magnifierRaf !== null) return;
+    const tick = (): void => {
+      this.updateMagnifierTransform();
+      this.updateMagnifierCrosshair();
+      this.magnifierRaf = requestAnimationFrame(tick);
+    };
+    this.magnifierRaf = requestAnimationFrame(tick);
+  }
+
+  private stopMagnifierLoop(): void {
+    if (this.magnifierRaf !== null) {
+      cancelAnimationFrame(this.magnifierRaf);
+      this.magnifierRaf = null;
+    }
+    const magImg = q<HTMLImageElement>("cam-magnifier-img");
+    magImg.removeAttribute("src");
+  }
+
+  private updateMagnifierTransform(): void {
+    this.ensureMagnifierFocus();
+    const focus = this.magnifierFocus;
+    if (!focus) return;
+    const magImg = q<HTMLImageElement>("cam-magnifier-img");
+    if (!magImg.naturalWidth || !magImg.naturalHeight) return;
+    const container = q<HTMLDivElement>("cam-magnifier");
+    const cw = container.clientWidth;
+    const ch = container.clientHeight;
+    if (cw <= 0 || ch <= 0) return;
+    const ZOOM = 4;
+    const tx = cw / (2 * ZOOM) - focus.x;
+    const ty = ch / (2 * ZOOM) - focus.y;
+    const transform = `scale(${ZOOM}) translate(${tx}px, ${ty}px)`;
+    if (magImg.style.transform !== transform) {
+      magImg.style.transform = transform;
+    }
+  }
+
+  private updateMagnifierCrosshair(): void {
+    const svg = q<SVGSVGElement>("cam-magnifier-crosshair");
+    svg.replaceChildren();
+    const cornerIdx = this.magnifierCornerIdx;
+    const corners = this.state.cameraRoi?.corners;
+    if (cornerIdx !== null && corners && corners.length === 4) {
+      // Corner mode: cyan rays from center along the polygon edges meeting
+      // at the dragged corner.
+      const center = corners[cornerIdx];
+      const adjacents = [
+        corners[(cornerIdx + 3) % 4],
+        corners[(cornerIdx + 1) % 4],
+      ];
+      for (const adj of adjacents) {
+        const dx = adj[0] - center[0];
+        const dy = adj[1] - center[1];
+        if (dx === 0 && dy === 0) continue;
+        const tx = Math.abs(dx) > 0 ? 50 / Math.abs(dx) : Infinity;
+        const ty = Math.abs(dy) > 0 ? 50 / Math.abs(dy) : Infinity;
+        const t = Math.min(tx, ty);
+        const ex = 50 + dx * t;
+        const ey = 50 + dy * t;
+        const line = document.createElementNS(SVG_NS, "line");
+        line.setAttribute("x1", "50");
+        line.setAttribute("y1", "50");
+        line.setAttribute("x2", String(ex));
+        line.setAttribute("y2", String(ey));
+        line.setAttribute("stroke", "#22d3ee");
+        line.setAttribute("stroke-width", "1");
+        line.setAttribute("vector-effect", "non-scaling-stroke");
+        svg.appendChild(line);
+      }
+      const dot = document.createElementNS(SVG_NS, "circle");
+      dot.setAttribute("cx", "50");
+      dot.setAttribute("cy", "50");
+      dot.setAttribute("r", "1.2");
+      dot.setAttribute("fill", "#22d3ee");
+      dot.setAttribute("vector-effect", "non-scaling-stroke");
+      svg.appendChild(dot);
+      return;
+    }
+    // Default: green plus crosshair with a small box.
+    const box = document.createElementNS(SVG_NS, "rect");
+    box.setAttribute("x", "47");
+    box.setAttribute("y", "47");
+    box.setAttribute("width", "6");
+    box.setAttribute("height", "6");
+    box.setAttribute("fill", "none");
+    box.setAttribute("stroke", "#4ade80");
+    box.setAttribute("stroke-width", "1");
+    box.setAttribute("vector-effect", "non-scaling-stroke");
+    svg.appendChild(box);
+    const v = document.createElementNS(SVG_NS, "line");
+    v.setAttribute("x1", "50");
+    v.setAttribute("y1", "44");
+    v.setAttribute("x2", "50");
+    v.setAttribute("y2", "56");
+    v.setAttribute("stroke", "#4ade80");
+    v.setAttribute("stroke-width", "1");
+    v.setAttribute("vector-effect", "non-scaling-stroke");
+    svg.appendChild(v);
+    const h = document.createElementNS(SVG_NS, "line");
+    h.setAttribute("x1", "44");
+    h.setAttribute("y1", "50");
+    h.setAttribute("x2", "56");
+    h.setAttribute("y2", "50");
+    h.setAttribute("stroke", "#4ade80");
+    h.setAttribute("stroke-width", "1");
+    h.setAttribute("vector-effect", "non-scaling-stroke");
+    svg.appendChild(h);
+  }
+
+  private updateCameraRoiOverlay(): void {
+    const svg = q<SVGSVGElement>("camera-roi-overlay");
+    const live = this.state.cameraOpen && !this.previewHidden;
+    const roi = this.state.cameraRoi;
+    const hasPolygon = roi !== null && roi.corners.length === 4;
+    // Show the polygon when editing OR when one is defined and enabled.
+    // Read-only display has no handles, no dim mask, just the dashed
+    // outline as a visual indicator that an ROI is set.
+    const showReadOnly = live && !this.roiEditMode && hasPolygon && roi!.enabled;
+    const visible =
+      this.state.cameraFrame !== null &&
+      live &&
+      (this.roiEditMode || showReadOnly);
+    if (!visible || !this.state.cameraFrame) {
+      svg.setAttribute("hidden", "");
+      svg.replaceChildren();
+      return;
+    }
+    const fw = this.state.cameraFrame.width;
+    const fh = this.state.cameraFrame.height;
+    svg.setAttribute("viewBox", `0 0 ${fw} ${fh}`);
+
+    // Default the polygon to a 10% inset rectangle when none is set yet so
+    // the user has 4 corners to grab onto without a server round-trip until
+    // they actually drag.
+    let corners: [number, number][];
+    if (hasPolygon) {
+      corners = roi!.corners.map(([x, y]) => [x, y] as [number, number]);
+    } else {
+      const ix = Math.round(fw * 0.1);
+      const iy = Math.round(fh * 0.1);
+      const iw = Math.round(fw * 0.8);
+      const ih = Math.round(fh * 0.8);
+      corners = [
+        [ix, iy],
+        [ix + iw, iy],
+        [ix + iw, iy + ih],
+        [ix, iy + ih],
+      ];
+    }
+    svg.replaceChildren();
+    const editing = this.roiEditMode;
+
+    // Dim mask outside the polygon — only in edit mode. Read-only display
+    // shows the dashed outline alone so the user can still see what's
+    // beyond their ROI.
+    if (editing) {
+      const maskId = "roi-poly-mask";
+      const defs = document.createElementNS(SVG_NS, "defs");
+      const maskEl = document.createElementNS(SVG_NS, "mask");
+      maskEl.setAttribute("id", maskId);
+      const maskRect = document.createElementNS(SVG_NS, "rect");
+      maskRect.setAttribute("x", "0");
+      maskRect.setAttribute("y", "0");
+      maskRect.setAttribute("width", String(fw));
+      maskRect.setAttribute("height", String(fh));
+      maskRect.setAttribute("fill", "white");
+      maskEl.appendChild(maskRect);
+      const maskHole = document.createElementNS(SVG_NS, "polygon");
+      maskHole.setAttribute(
+        "points",
+        corners.map(([x, y]) => `${x},${y}`).join(" "),
+      );
+      maskHole.setAttribute("fill", "black");
+      maskEl.appendChild(maskHole);
+      defs.appendChild(maskEl);
+      svg.appendChild(defs);
+
+      const dim = document.createElementNS(SVG_NS, "rect");
+      dim.setAttribute("x", "0");
+      dim.setAttribute("y", "0");
+      dim.setAttribute("width", String(fw));
+      dim.setAttribute("height", String(fh));
+      dim.setAttribute("fill", "rgba(0,0,0,0.45)");
+      dim.setAttribute("mask", `url(#${maskId})`);
+      svg.appendChild(dim);
+    }
+
+    // Cyan dashed outline through the 4 corners.
+    const outline = document.createElementNS(SVG_NS, "polygon");
+    outline.setAttribute(
+      "points",
+      corners.map(([x, y]) => `${x},${y}`).join(" "),
+    );
+    outline.setAttribute("fill", "none");
+    outline.setAttribute("stroke", "#22d3ee");
+    outline.setAttribute(
+      "stroke-width",
+      String(Math.max(2, Math.min(fw, fh) / 300)),
+    );
+    outline.setAttribute(
+      "stroke-dasharray",
+      `${Math.max(6, fw / 100)} ${Math.max(4, fw / 200)}`,
+    );
+    svg.appendChild(outline);
+
+    // 4 corner handles + TL/TR/BR/BL labels — only in edit mode.
+    if (editing) {
+      const labels = ["TL", "TR", "BR", "BL"];
+      const r = Math.max(12, Math.min(fw, fh) / 50);
+      const fontSize = Math.max(12, Math.min(fw, fh) / 60);
+      corners.forEach(([cx, cy], i) => {
+        const handle = document.createElementNS(SVG_NS, "circle");
+        handle.setAttribute("cx", String(cx));
+        handle.setAttribute("cy", String(cy));
+        handle.setAttribute("r", String(r));
+        handle.setAttribute("fill", "rgba(34,211,238,0.4)");
+        handle.setAttribute("stroke", "#22d3ee");
+        handle.setAttribute(
+          "stroke-width",
+          String(Math.max(2, Math.min(fw, fh) / 300)),
+        );
+        handle.setAttribute("data-roi-handle", String(i));
+        handle.setAttribute("style", "cursor: grab");
+        handle.addEventListener("pointerdown", (ev) =>
+          this.startCameraRoiCornerDrag(i, ev, corners, fw, fh),
+        );
+        svg.appendChild(handle);
+
+        const label = document.createElementNS(SVG_NS, "text");
+        label.setAttribute("x", String(cx));
+        label.setAttribute("y", String(cy - r - 4));
+        label.setAttribute("text-anchor", "middle");
+        label.setAttribute("fill", "#22d3ee");
+        label.setAttribute("stroke", "#0a0c10");
+        label.setAttribute("stroke-width", "0.5");
+        label.setAttribute("font-size", String(fontSize));
+        label.setAttribute("font-family", "ui-monospace, monospace");
+        label.setAttribute("font-weight", "bold");
+        label.textContent = labels[i];
+        svg.appendChild(label);
+      });
+    }
+
+    svg.removeAttribute("hidden");
+  }
+
+  private startCameraRoiCornerDrag(
+    cornerIdx: number,
+    ev: PointerEvent,
+    startCorners: [number, number][],
+    frameW: number,
+    frameH: number,
+  ): void {
+    ev.preventDefault();
+    const target = ev.target as Element;
+    target.setPointerCapture?.(ev.pointerId);
+    this.magnifierCornerDragActive = true;
+
+    // Convert client-space deltas to cam-pixel deltas. The overlay uses
+    // preserveAspectRatio="xMidYMid meet" (matching the <img>'s `object-fit:
+    // contain`), so the viewBox is uniformly fit inside the SVG bounding
+    // rect with letterboxing. Same uniform scale applies on both axes.
+    const svg = q<SVGSVGElement>("camera-roi-overlay");
+    const rect = svg.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    const scale = Math.min(rect.width / frameW, rect.height / frameH);
+    if (scale <= 0) return;
+    const inv = 1 / scale;
+
+    const startClientX = ev.clientX;
+    const startClientY = ev.clientY;
+    const initial = startCorners.map(
+      ([x, y]) => [x, y] as [number, number],
+    );
+
+    let lastSentAt = 0;
+    const SEND_INTERVAL_MS = 80;
+
+    const onMove = (e: PointerEvent): void => {
+      const dx = (e.clientX - startClientX) * inv;
+      const dy = (e.clientY - startClientY) * inv;
+      const moved: [number, number][] = initial.map((pt, i) => {
+        if (i !== cornerIdx) return [pt[0], pt[1]];
+        return [
+          clamp(pt[0] + dx, 0, frameW),
+          clamp(pt[1] + dy, 0, frameH),
+        ];
+      });
+      this.state.cameraRoi = {
+        corners: moved.map(([x, y]) => [Math.round(x), Math.round(y)]) as [
+          number,
+          number,
+        ][],
+        // Preserve current enabled flag if any; default to true when this
+        // is the user's first drag (no prior ROI).
+        enabled: this.state.cameraRoi?.enabled ?? true,
+        updated_at: 0,
+      };
+      this.magnifierFocus = {
+        x: moved[cornerIdx][0],
+        y: moved[cornerIdx][1],
+      };
+      this.magnifierCornerIdx = cornerIdx;
+      this.updateCameraRoiOverlay();
+      const now = performance.now();
+      if (now - lastSentAt >= SEND_INTERVAL_MS) {
+        this.sendCameraRoi(this.state.cameraRoi);
+        lastSentAt = now;
+      }
+    };
+    const onUp = (): void => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      if (this.state.cameraRoi) this.sendCameraRoi(this.state.cameraRoi);
+      this.magnifierCornerDragActive = false;
+      this.magnifierCornerIdx = null;
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
+
+  private sendCameraRoi(roi: CameraRoi): void {
+    this.ws.send({
+      type: "set_camera_roi",
+      corners: roi.corners,
+      clear: false,
+    });
   }
 
   private refreshMeasurementHint(): void {

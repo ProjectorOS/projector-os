@@ -119,11 +119,36 @@
 
         <!-- View shown when a camera is open and the user isn't switching. -->
         <div data-role="camera-live" hidden>
-          <div class="calib-preview" data-role="cam-preview">
-            <img data-role="cam-preview-img" alt="Camera preview" />
-            <svg class="calib-overlay" data-role="marker-overlay"
-                 preserveAspectRatio="xMidYMid meet"
-                 xmlns="http://www.w3.org/2000/svg" hidden></svg>
+          <!-- Preview row: cursor magnifier on the left, camera image on
+               the right. The magnifier is mounted only while the user is
+               in ROI edit mode so the camera card stays uncluttered for
+               users who don't need it. -->
+          <div class="cam-preview-row" data-role="cam-preview-row">
+            <!-- Cursor magnifier. Only mounted in ROI edit mode. The inner
+                 <img> is scaled and translated so the focus point lands at
+                 the container's center. Focus follows the cursor over the
+                 preview, snaps to the dragged corner during a drag, and
+                 falls back to camera-frame center otherwise. -->
+            <div class="cam-magnifier" data-role="cam-magnifier" hidden>
+              <img data-role="cam-magnifier-img" alt="Magnified" />
+              <svg class="cam-magnifier-crosshair" data-role="cam-magnifier-crosshair"
+                   viewBox="0 0 100 100" preserveAspectRatio="none"
+                   xmlns="http://www.w3.org/2000/svg"></svg>
+            </div>
+            <div class="calib-preview" data-role="cam-preview">
+              <img data-role="cam-preview-img" alt="Camera preview" />
+              <svg class="calib-overlay" data-role="marker-overlay"
+                   preserveAspectRatio="xMidYMid meet"
+                   xmlns="http://www.w3.org/2000/svg" hidden></svg>
+              <!-- ROI polygon overlay: dim mask outside the polygon, cyan
+                   outline + 4 draggable corner handles. preserveAspectRatio
+                   matches the <img>'s `object-fit: contain` so the overlay
+                   aligns pixel-for-pixel with the camera frame. -->
+              <svg class="calib-overlay calib-overlay-interactive"
+                   data-role="camera-roi-overlay"
+                   preserveAspectRatio="xMidYMid meet"
+                   xmlns="http://www.w3.org/2000/svg" hidden></svg>
+            </div>
           </div>
           <div class="row">
             <span class="pill ok">Live</span>
@@ -139,7 +164,22 @@
                     title="Cycle preview rotation. Cosmetic only — does not affect calibration.">Rotate preview</button>
             <button data-role="camera-preview-toggle-btn"
                     title="Hides the preview + heartbeat without closing the camera. The server keeps capturing frames.">Close preview</button>
+            <!-- ROI editor toggle. When on, the polygon overlay + magnifier
+                 are mounted and the 4 corners are draggable. When off, the
+                 saved polygon (if enabled) shows as a read-only outline. -->
+            <button data-role="camera-roi-toggle-btn"
+                    title="Edit a 4-corner polygon over the camera frame.">Edit ROI</button>
+            <!-- Visibility toggle: hides/shows the saved polygon without
+                 clearing it. Useful when the user wants the full-camera
+                 view back without losing the ROI definition. -->
+            <button data-role="camera-roi-visibility-btn"
+                    title="Hide the saved polygon (preserves corners; click again to show)."
+                    hidden>Hide ROI</button>
+            <button data-role="camera-roi-reset-btn"
+                    title="Clear the saved polygon."
+                    hidden>Reset ROI</button>
           </div>
+          <div class="help" data-role="camera-roi-info" hidden></div>
         </div>
 
         <!-- Picker view: shown when no camera is open, or when switching. -->
