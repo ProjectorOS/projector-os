@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from server import camera_roi as cam_roi_persist
 from server import preferences as prefs_persist
 from server import work_surface as ws_persist
 from server.bus import Bus
@@ -41,6 +42,8 @@ from server.protocol import (
     CalibrationPromptEvent,
     CalibrationUpdatedEvent,
     CameraChangedEvent,
+    CameraRoi,
+    CameraRoiUpdatedEvent,
     DetectedHand,
     DetectedObject,
     DetectionsEvent,
@@ -63,6 +66,7 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 CALIBRATION_PATH = DATA_DIR / "calibration.json"
 WORK_SURFACE_PATH = DATA_DIR / "work_surface.json"
 PREFERENCES_PATH = DATA_DIR / "preferences.json"
+CAMERA_ROI_PATH = DATA_DIR / "camera_roi.json"
 # Keep a tracked object on the projection for this long after its marker stops being
 # detected. Smooths over single-frame detection misses (occlusion by a hand, motion
 # blur, glare) so objects don't flicker on/off.
@@ -256,6 +260,10 @@ class AppState:
         self.mode: Mode = "track" if self.calibration is not None else "idle"
         self.projector_dims: tuple[int, int] | None = None
         self.work_surface: WorkSurface | None = ws_persist.load(WORK_SURFACE_PATH)
+        # User-defined polygon on the camera frame (4 cam_px corners). No
+        # server-side consumer yet — purely an annotation surfaced via the
+        # camera card UI. None until the user defines one.
+        self.camera_roi: CameraRoi | None = cam_roi_persist.load(CAMERA_ROI_PATH)
         self.camera_index: int | None = None
         self.launcher = ProjectorLauncher()
         self.preferences = prefs_persist.load(PREFERENCES_PATH)
@@ -453,6 +461,21 @@ class AppState:
             self.preferences.show_work_surface_outline = show_outline
             prefs_persist.save(self.preferences, PREFERENCES_PATH)
         await self._broadcast_work_surface()
+
+    async def set_camera_roi(
+        self, corners: list[list[float]], clear: bool
+    ) -> None:
+        if clear or len(corners) != 4:
+            self.camera_roi = None
+        else:
+            self.camera_roi = CameraRoi(
+                corners=[[float(p[0]), float(p[1])] for p in corners],
+                updated_at=time.time(),
+            )
+        cam_roi_persist.save(self.camera_roi, CAMERA_ROI_PATH)
+        await self.bus.broadcast(
+            CameraRoiUpdatedEvent(camera_roi=self.camera_roi)
+        )
 
     async def _broadcast_work_surface(self) -> None:
         if self.work_surface is None:
@@ -814,6 +837,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 show_work_surface_outline=state.show_work_surface_outline,
                 camera_index=state.camera_index,
                 camera_open=state.camera is not None,
+                camera_roi=state.camera_roi,
             ).model_dump(mode="json")
         )
         while True:
@@ -840,6 +864,11 @@ async def ws_endpoint(ws: WebSocket) -> None:
             elif mtype == "set_camera":
                 idx = msg.get("index")
                 await state.set_camera(int(idx) if idx is not None else None)
+            elif mtype == "set_camera_roi":
+                await state.set_camera_roi(
+                    msg.get("corners", []),
+                    bool(msg.get("clear", False)),
+                )
             else:
                 log.warning("unknown command type: %s", mtype)
     except WebSocketDisconnect:

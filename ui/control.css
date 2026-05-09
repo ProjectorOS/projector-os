@@ -347,10 +347,87 @@ input[type="text"][data-role="measurement-input"] {
   height: 100%;
   pointer-events: none;
 }
+/* The camera-ROI overlay needs pointer events on its drag handles, but the
+   surrounding mask must stay click-through. Handles set pointer-events:
+   auto explicitly. */
+.calib-overlay-interactive {
+  pointer-events: none;
+}
+.calib-overlay-interactive [data-roi-handle] {
+  pointer-events: auto;
+}
 .calib-preview.rot-180 img,
 .calib-preview.rot-180 .calib-overlay {
   transform: rotate(180deg);
   transform-origin: center;
+}
+
+/* Camera preview + magnifier row. The row gets an explicit height so the
+   magnifier's `height: 100%` is anchored to a definite value — without
+   that, `aspect-ratio: 1` on the magnifier would override the otherwise-
+   working `align-self: stretch` (per CSS Sizing 4) and the magnifier would
+   collapse back to its intrinsic content size. */
+.cam-preview-row {
+  display: flex;
+  gap: 12px;
+  align-items: stretch;
+  flex-wrap: wrap;
+  margin: 10px 0 12px;
+  height: 360px;
+}
+/* Author `display: flex` above wins over the user-agent `[hidden] {
+   display: none }` rule (same specificity, author > UA), so we need an
+   explicit override to actually collapse the row when hidden. */
+.cam-preview-row[hidden] {
+  display: none;
+}
+.cam-preview-row .calib-preview {
+  flex: 1 1 280px;
+  min-width: 0;
+  margin: 0;
+  height: 100%;
+}
+.cam-preview-row .calib-preview img {
+  /* In the row layout we want the image to fill the fixed-height row so
+     the magnifier next to it has a stable height to anchor on. */
+  height: 100%;
+  max-height: none;
+}
+
+/* Cursor magnifier: square. The container's height is 100% of the parent
+   row (definite, see above), and aspect-ratio: 1 makes width match height. */
+.cam-magnifier {
+  flex: 0 0 auto;
+  height: 100%;
+  width: auto;
+  aspect-ratio: 1;
+  background: #000;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  overflow: hidden;
+  position: relative;
+  line-height: 0;
+}
+.cam-magnifier[hidden] {
+  display: none;
+}
+.cam-magnifier img {
+  display: block;
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+  image-rendering: pixelated;
+  /* Suppress the broken-image icon when src is detached during teardown. */
+  font-size: 0;
+  color: transparent;
+}
+.cam-magnifier-crosshair {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
 }
 
 .heartbeat-row {
