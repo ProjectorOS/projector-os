@@ -250,10 +250,41 @@ class ControlApp {
     q("camera-roi-toggle-btn").addEventListener("click", () => {
       this.roiEditMode = !this.roiEditMode;
       writeBool("roiEditMode", this.roiEditMode);
+      // Entering edit mode on a hidden polygon would mean dragging handles
+      // you can't see — re-enable visibility on the way in.
+      const roi = this.state.cameraRoi;
+      if (
+        this.roiEditMode &&
+        roi !== null &&
+        roi.corners.length === 4 &&
+        !roi.enabled
+      ) {
+        this.ws.send({
+          type: "set_camera_roi",
+          corners: roi.corners,
+          enabled: true,
+        });
+      }
       this.applyCameraCard();
     });
     q("camera-roi-reset-btn").addEventListener("click", () => {
       this.ws.send({ type: "set_camera_roi", corners: [], clear: true });
+    });
+    q("camera-roi-visibility-btn").addEventListener("click", () => {
+      const roi = this.state.cameraRoi;
+      if (!roi || roi.corners.length !== 4) return;
+      // Hiding while editing forces edit mode off — there's no point
+      // dragging handles you can't see.
+      const next = !roi.enabled;
+      if (!next && this.roiEditMode) {
+        this.roiEditMode = false;
+        writeBool("roiEditMode", false);
+      }
+      this.ws.send({
+        type: "set_camera_roi",
+        corners: roi.corners,
+        enabled: next,
+      });
     });
     // Capture cam-frame natural size from the preview <img> as soon as it
     // loads so the ROI overlay knows how to map between cam_px and CSS px.
@@ -630,15 +661,26 @@ class ControlApp {
       ? "Show preview"
       : "Close preview";
 
-    // ROI editor mount/unmount. Polygon overlay + magnifier are only visible
-    // in edit mode; outside of it the camera card is just the plain preview.
+    // ROI overlay visibility:
+    //   - polygon outline + dim mask: shown whenever a polygon is defined
+    //     and `enabled` is true (read-only outside edit mode);
+    //   - corner handles + magnifier: only shown in edit mode.
+    // The magnifier only "opens" (mounts the MJPEG stream + RAF loop) when
+    // edit mode is active — clicking "Edit ROI" is what brings up the
+    // cursor-zoom preview.
+    const roi = this.state.cameraRoi;
+    const roiVisible =
+      live &&
+      !this.previewHidden &&
+      (this.roiEditMode ||
+        (roi !== null && roi.corners.length === 4 && roi.enabled));
     const editing = live && this.roiEditMode && !this.previewHidden;
     if (editing) {
       this.mountMagnifier();
     } else {
       this.unmountMagnifier();
     }
-    q<SVGSVGElement>("camera-roi-overlay").toggleAttribute("hidden", !editing);
+    q<SVGSVGElement>("camera-roi-overlay").toggleAttribute("hidden", !roiVisible);
     q<HTMLButtonElement>("camera-roi-toggle-btn").classList.toggle(
       "active",
       this.roiEditMode,
@@ -646,7 +688,7 @@ class ControlApp {
     q<HTMLButtonElement>("camera-roi-toggle-btn").textContent = this.roiEditMode
       ? "Done editing ROI"
       : "Edit ROI";
-    if (editing) this.updateCameraRoiOverlay();
+    if (roiVisible) this.updateCameraRoiOverlay();
     this.applyCameraRoiControls();
 
     const errorNode = q("camera-error");
@@ -1084,18 +1126,32 @@ class ControlApp {
   // ─── Camera ROI editor ────────────────────────────────────────────────
 
   private applyCameraRoiControls(): void {
-    // Helper text and "Reset ROI" button visibility, gated on edit mode +
-    // whether a polygon currently exists.
-    const editing = this.roiEditMode && this.state.cameraOpen && !this.previewHidden;
+    // Buttons + helper text shown alongside the camera preview.
+    //   Edit ROI       — visible whenever the camera is live (toggles edit mode).
+    //   Hide / Show ROI — visible when a polygon is defined; toggles `enabled`.
+    //   Reset ROI      — visible when a polygon is defined.
+    //   Help line      — only in edit mode.
+    const live = this.state.cameraOpen && !this.previewHidden;
+    const roi = this.state.cameraRoi;
+    const hasPolygon = roi !== null && roi.corners.length === 4;
+    const editing = live && this.roiEditMode;
     const info = q("camera-roi-info");
     const reset = q<HTMLButtonElement>("camera-roi-reset-btn");
+    const visibility = q<HTMLButtonElement>("camera-roi-visibility-btn");
     info.hidden = !editing;
-    reset.hidden = !(editing && this.state.cameraRoi !== null);
+    reset.hidden = !(live && hasPolygon);
+    visibility.hidden = !(live && hasPolygon);
+    if (live && hasPolygon) {
+      const enabled = roi!.enabled;
+      visibility.textContent = enabled ? "Hide ROI" : "Show ROI";
+      visibility.title = enabled
+        ? "Hide the saved polygon (preserves corners; click again to show)."
+        : "Re-show the saved polygon.";
+    }
     if (editing) {
-      info.textContent =
-        this.state.cameraRoi && this.state.cameraRoi.corners.length === 4
-          ? "Polygon set. Drag any cyan corner to refine."
-          : "Drag the 4 cyan corner handles on the preview to define the polygon.";
+      info.textContent = hasPolygon
+        ? "Polygon set. Drag any cyan corner to refine."
+        : "Drag the 4 cyan corner handles on the preview to define the polygon.";
     }
   }
 
@@ -1300,11 +1356,17 @@ class ControlApp {
 
   private updateCameraRoiOverlay(): void {
     const svg = q<SVGSVGElement>("camera-roi-overlay");
+    const live = this.state.cameraOpen && !this.previewHidden;
+    const roi = this.state.cameraRoi;
+    const hasPolygon = roi !== null && roi.corners.length === 4;
+    // Show the polygon when editing OR when one is defined and enabled.
+    // Read-only display has no handles, no dim mask, just the dashed
+    // outline as a visual indicator that an ROI is set.
+    const showReadOnly = live && !this.roiEditMode && hasPolygon && roi!.enabled;
     const visible =
-      this.roiEditMode &&
-      this.state.cameraOpen &&
-      !this.previewHidden &&
-      this.state.cameraFrame !== null;
+      this.state.cameraFrame !== null &&
+      live &&
+      (this.roiEditMode || showReadOnly);
     if (!visible || !this.state.cameraFrame) {
       svg.setAttribute("hidden", "");
       svg.replaceChildren();
@@ -1318,10 +1380,8 @@ class ControlApp {
     // the user has 4 corners to grab onto without a server round-trip until
     // they actually drag.
     let corners: [number, number][];
-    if (this.state.cameraRoi && this.state.cameraRoi.corners.length === 4) {
-      corners = this.state.cameraRoi.corners.map(
-        ([x, y]) => [x, y] as [number, number],
-      );
+    if (hasPolygon) {
+      corners = roi!.corners.map(([x, y]) => [x, y] as [number, number]);
     } else {
       const ix = Math.round(fw * 0.1);
       const iy = Math.round(fh * 0.1);
@@ -1335,39 +1395,42 @@ class ControlApp {
       ];
     }
     svg.replaceChildren();
+    const editing = this.roiEditMode;
 
-    // Dim mask outside the polygon: an SVG mask with a white frame and a
-    // black polygon hole. Multiplied against a semi-transparent black
-    // overlay, it dims outside / clears inside.
-    const maskId = "roi-poly-mask";
-    const defs = document.createElementNS(SVG_NS, "defs");
-    const maskEl = document.createElementNS(SVG_NS, "mask");
-    maskEl.setAttribute("id", maskId);
-    const maskRect = document.createElementNS(SVG_NS, "rect");
-    maskRect.setAttribute("x", "0");
-    maskRect.setAttribute("y", "0");
-    maskRect.setAttribute("width", String(fw));
-    maskRect.setAttribute("height", String(fh));
-    maskRect.setAttribute("fill", "white");
-    maskEl.appendChild(maskRect);
-    const maskHole = document.createElementNS(SVG_NS, "polygon");
-    maskHole.setAttribute(
-      "points",
-      corners.map(([x, y]) => `${x},${y}`).join(" "),
-    );
-    maskHole.setAttribute("fill", "black");
-    maskEl.appendChild(maskHole);
-    defs.appendChild(maskEl);
-    svg.appendChild(defs);
+    // Dim mask outside the polygon — only in edit mode. Read-only display
+    // shows the dashed outline alone so the user can still see what's
+    // beyond their ROI.
+    if (editing) {
+      const maskId = "roi-poly-mask";
+      const defs = document.createElementNS(SVG_NS, "defs");
+      const maskEl = document.createElementNS(SVG_NS, "mask");
+      maskEl.setAttribute("id", maskId);
+      const maskRect = document.createElementNS(SVG_NS, "rect");
+      maskRect.setAttribute("x", "0");
+      maskRect.setAttribute("y", "0");
+      maskRect.setAttribute("width", String(fw));
+      maskRect.setAttribute("height", String(fh));
+      maskRect.setAttribute("fill", "white");
+      maskEl.appendChild(maskRect);
+      const maskHole = document.createElementNS(SVG_NS, "polygon");
+      maskHole.setAttribute(
+        "points",
+        corners.map(([x, y]) => `${x},${y}`).join(" "),
+      );
+      maskHole.setAttribute("fill", "black");
+      maskEl.appendChild(maskHole);
+      defs.appendChild(maskEl);
+      svg.appendChild(defs);
 
-    const dim = document.createElementNS(SVG_NS, "rect");
-    dim.setAttribute("x", "0");
-    dim.setAttribute("y", "0");
-    dim.setAttribute("width", String(fw));
-    dim.setAttribute("height", String(fh));
-    dim.setAttribute("fill", "rgba(0,0,0,0.45)");
-    dim.setAttribute("mask", `url(#${maskId})`);
-    svg.appendChild(dim);
+      const dim = document.createElementNS(SVG_NS, "rect");
+      dim.setAttribute("x", "0");
+      dim.setAttribute("y", "0");
+      dim.setAttribute("width", String(fw));
+      dim.setAttribute("height", String(fh));
+      dim.setAttribute("fill", "rgba(0,0,0,0.45)");
+      dim.setAttribute("mask", `url(#${maskId})`);
+      svg.appendChild(dim);
+    }
 
     // Cyan dashed outline through the 4 corners.
     const outline = document.createElementNS(SVG_NS, "polygon");
@@ -1387,41 +1450,43 @@ class ControlApp {
     );
     svg.appendChild(outline);
 
-    // 4 corner handles + TL/TR/BR/BL labels so corner ordering is visible.
-    const labels = ["TL", "TR", "BR", "BL"];
-    const r = Math.max(12, Math.min(fw, fh) / 50);
-    const fontSize = Math.max(12, Math.min(fw, fh) / 60);
-    corners.forEach(([cx, cy], i) => {
-      const handle = document.createElementNS(SVG_NS, "circle");
-      handle.setAttribute("cx", String(cx));
-      handle.setAttribute("cy", String(cy));
-      handle.setAttribute("r", String(r));
-      handle.setAttribute("fill", "rgba(34,211,238,0.4)");
-      handle.setAttribute("stroke", "#22d3ee");
-      handle.setAttribute(
-        "stroke-width",
-        String(Math.max(2, Math.min(fw, fh) / 300)),
-      );
-      handle.setAttribute("data-roi-handle", String(i));
-      handle.setAttribute("style", "cursor: grab");
-      handle.addEventListener("pointerdown", (ev) =>
-        this.startCameraRoiCornerDrag(i, ev, corners, fw, fh),
-      );
-      svg.appendChild(handle);
+    // 4 corner handles + TL/TR/BR/BL labels — only in edit mode.
+    if (editing) {
+      const labels = ["TL", "TR", "BR", "BL"];
+      const r = Math.max(12, Math.min(fw, fh) / 50);
+      const fontSize = Math.max(12, Math.min(fw, fh) / 60);
+      corners.forEach(([cx, cy], i) => {
+        const handle = document.createElementNS(SVG_NS, "circle");
+        handle.setAttribute("cx", String(cx));
+        handle.setAttribute("cy", String(cy));
+        handle.setAttribute("r", String(r));
+        handle.setAttribute("fill", "rgba(34,211,238,0.4)");
+        handle.setAttribute("stroke", "#22d3ee");
+        handle.setAttribute(
+          "stroke-width",
+          String(Math.max(2, Math.min(fw, fh) / 300)),
+        );
+        handle.setAttribute("data-roi-handle", String(i));
+        handle.setAttribute("style", "cursor: grab");
+        handle.addEventListener("pointerdown", (ev) =>
+          this.startCameraRoiCornerDrag(i, ev, corners, fw, fh),
+        );
+        svg.appendChild(handle);
 
-      const label = document.createElementNS(SVG_NS, "text");
-      label.setAttribute("x", String(cx));
-      label.setAttribute("y", String(cy - r - 4));
-      label.setAttribute("text-anchor", "middle");
-      label.setAttribute("fill", "#22d3ee");
-      label.setAttribute("stroke", "#0a0c10");
-      label.setAttribute("stroke-width", "0.5");
-      label.setAttribute("font-size", String(fontSize));
-      label.setAttribute("font-family", "ui-monospace, monospace");
-      label.setAttribute("font-weight", "bold");
-      label.textContent = labels[i];
-      svg.appendChild(label);
-    });
+        const label = document.createElementNS(SVG_NS, "text");
+        label.setAttribute("x", String(cx));
+        label.setAttribute("y", String(cy - r - 4));
+        label.setAttribute("text-anchor", "middle");
+        label.setAttribute("fill", "#22d3ee");
+        label.setAttribute("stroke", "#0a0c10");
+        label.setAttribute("stroke-width", "0.5");
+        label.setAttribute("font-size", String(fontSize));
+        label.setAttribute("font-family", "ui-monospace, monospace");
+        label.setAttribute("font-weight", "bold");
+        label.textContent = labels[i];
+        svg.appendChild(label);
+      });
+    }
 
     svg.removeAttribute("hidden");
   }
@@ -1473,6 +1538,9 @@ class ControlApp {
           number,
           number,
         ][],
+        // Preserve current enabled flag if any; default to true when this
+        // is the user's first drag (no prior ROI).
+        enabled: this.state.cameraRoi?.enabled ?? true,
         updated_at: 0,
       };
       this.magnifierFocus = {

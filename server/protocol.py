@@ -59,12 +59,17 @@ class CameraRoi(BaseModel):
     `corners` is a 4-point polygon in cam_px (TL/TR/BR/BL order). Stored
     purely as an annotation for now — no server-side consumer; future
     features (keystone correction, masking) can pick it up.
+
+    `enabled` lets the user hide the polygon overlay (and signal "ignore
+    this ROI" to future consumers) without losing the saved corners. The
+    polygon is preserved on disk regardless; only the enabled flag flips.
     """
 
     corners: list[list[float]] = Field(
         default_factory=list,
         description="4 [x, y] cam-pixel points in TL/TR/BR/BL order.",
     )
+    enabled: bool = True
     updated_at: float
 
 
@@ -231,16 +236,20 @@ class SetCameraCommand(BaseModel):
 
 
 class SetCameraRoiCommand(BaseModel):
-    """Set or clear the user-defined camera-frame ROI polygon.
+    """Set, clear, or toggle visibility of the user-defined camera-frame
+    ROI polygon.
 
-    When `clear=True` the polygon is removed and the persistence file deleted.
-    When `clear=False` (default), `corners` defines a 4-point polygon in
-    cam_px (TL/TR/BR/BL order).
+    - `clear=True` — remove the polygon and delete the persistence file.
+    - `corners` (4 points, TL/TR/BR/BL) — replace the saved polygon.
+    - `enabled` — flip the visibility flag without changing the corners.
+      Sent alone (no `corners`, `clear=False`) when the user clicks the
+      Show/Hide ROI toggle.
     """
 
     type: Literal["set_camera_roi"] = "set_camera_roi"
     corners: list[list[float]] = Field(default_factory=list)
     clear: bool = False
+    enabled: bool | None = None
 
 
 ClientCommand = Union[

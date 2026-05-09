@@ -463,15 +463,37 @@ class AppState:
         await self._broadcast_work_surface()
 
     async def set_camera_roi(
-        self, corners: list[list[float]], clear: bool
+        self,
+        corners: list[list[float]],
+        clear: bool,
+        enabled: bool | None = None,
     ) -> None:
-        if clear or len(corners) != 4:
+        # Three messages: clear (drop everything), update corners (replace
+        # polygon, preserve enabled unless explicitly given), and toggle
+        # enabled (no corners, just flip the visibility flag).
+        if clear:
             self.camera_roi = None
-        else:
+        elif len(corners) == 4:
+            new_enabled = (
+                enabled
+                if enabled is not None
+                else (self.camera_roi.enabled if self.camera_roi else True)
+            )
             self.camera_roi = CameraRoi(
                 corners=[[float(p[0]), float(p[1])] for p in corners],
+                enabled=bool(new_enabled),
                 updated_at=time.time(),
             )
+        elif enabled is not None and self.camera_roi is not None:
+            self.camera_roi = CameraRoi(
+                corners=self.camera_roi.corners,
+                enabled=bool(enabled),
+                updated_at=time.time(),
+            )
+        else:
+            # Nothing to apply (no corners, no clear, no enabled-only on a
+            # polygon). Treat as a no-op.
+            return
         cam_roi_persist.save(self.camera_roi, CAMERA_ROI_PATH)
         await self.bus.broadcast(
             CameraRoiUpdatedEvent(camera_roi=self.camera_roi)
@@ -865,9 +887,14 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 idx = msg.get("index")
                 await state.set_camera(int(idx) if idx is not None else None)
             elif mtype == "set_camera_roi":
+                raw_enabled = msg.get("enabled")
+                enabled = (
+                    bool(raw_enabled) if raw_enabled is not None else None
+                )
                 await state.set_camera_roi(
                     msg.get("corners", []),
                     bool(msg.get("clear", False)),
+                    enabled,
                 )
             else:
                 log.warning("unknown command type: %s", mtype)

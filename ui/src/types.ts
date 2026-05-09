@@ -44,6 +44,10 @@ export interface CameraRoi {
   // 4 [x, y] cam-pixel corners in TL/TR/BR/BL order. Stored purely as a
   // user annotation for now; no server-side consumer yet.
   corners: [number, number][];
+  // When false, the polygon is hidden in the camera card and any future
+  // consumer should treat the ROI as off. The corners are preserved on
+  // disk so toggling back on restores them.
+  enabled: boolean;
   updated_at: number;
 }
 
@@ -106,4 +110,7 @@ export type ClientCommand =
       // 4 [x, y] cam-pixel corners (TL/TR/BR/BL). Ignored when clear=true.
       corners: [number, number][];
       clear?: boolean;
+      // Toggle visibility flag; when omitted, the server preserves the
+      // existing value (or defaults to true for newly-defined polygons).
+      enabled?: boolean;
     };
