@@ -331,7 +331,7 @@ flowchart LR
     S1["Sensing<br/>cameras, capability workers"]
     S2["Phones<br/>via gateway"]
     S3["Screen-bound devices<br/>operator mouse and keyboard, via shell"]
-    S4["Input providers<br/>seized HID, gamepad, MIDI, serial, OSC, BLE"]
+    S4["Input providers<br/>input bridges, seized HID, gamepad, MIDI, serial, OSC"]
   end
   S1 & S2 & S3 & S4 --> R["Broker input router<br/>fusion, binding, focus, grants"]
   R --> A1[App A]
@@ -346,7 +346,7 @@ There are two kinds of local device:
 | Kind | Example | Captured by | Routed by |
 |---|---|---|---|
 | **Screen-bound** | The operator's mouse and keyboard; a touchscreen on a display output | The shell (Electron), as normal OS input | Spatial input through the inverse warp to surface coordinates; keys by focus |
-| **Tracked** | A mouse or keyboard on the table with a marker on it | A backend input provider that takes the device exclusively | Its physical pose (section 7.2) |
+| **Tracked** | A mouse or keyboard on the table with a marker on it | A backend input provider, through an input bridge or software seizing | Its physical pose (section 7.2) |
 
 Input routing rules:
 
@@ -391,15 +391,45 @@ The router fuses both with a filter. HID deltas drive responsiveness, and camera
 
 Bindings are stored in the tangible registry, so a known device is recognized whenever its marker appears. A phone can bind itself with no setup by showing a marker on its own screen.
 
-**Taking devices away from the OS.** A tracked mouse must not move the system cursor, and a tracked keyboard must not type into the focused window. Input providers take tracked devices exclusively:
+**Keeping tracked devices away from the OS.** A tracked mouse must not move the system cursor, and a tracked keyboard must not type into the focused window. The preferred way to achieve this is hardware: an **input bridge** between the device and the computer, so the OS never sees a mouse or keyboard at all. Seizing devices in software is the fallback.
 
-| OS | Mechanism | Note |
+```mermaid
+flowchart LR
+  DEV["Mouse / keyboard<br/>(or its wireless receiver)"] -- USB --> BR["Input bridge<br/>microcontroller:<br/>USB host + USB device"]
+  BR -- "USB, vendor-defined HID<br/>(not an input device to the OS)" --> PC["Input provider<br/>reads via hidapi"]
+  BT["Bluetooth device"] -. BLE / Classic .-> BRW["Wireless bridge<br/>ESP32"]
+  BRW -. "Wi-Fi or USB serial" .-> PC
+  PC --> RT[Broker input router]
+```
+
+How the bridge works:
+
+- Its firmware acts as the **USB host** for the real device and receives its raw HID reports.
+- It presents itself to the computer on a **vendor-defined HID usage page**. The OS sees an unknown data device, so it moves no cursor and types nothing. Vendor-defined HID needs no driver on macOS, Linux or Windows, can be read from user space with `hidapi` (from Python or Rust, or even WebHID), and on macOS does not require the Input Monitoring permission.
+- The firmware stays simple: it forwards the device's **report descriptor and raw reports**, and the input provider on the computer parses them. Supporting a new kind of device needs no firmware update.
+- Each bridge has a **serial number** and can store the tangible it belongs to, such as "my device wears `apriltag/36h11/12`", in its own flash. Plugging the bridge into any ProjectorOS machine binds the device immediately, so a bridge plus a printed marker forms a reusable kit.
+- **Identical devices stay separate.** Four mice on four bridges are four streams, which the OS would otherwise merge into one cursor.
+- **Wireless devices** work by plugging their receiver into the bridge. Bluetooth devices pair with a wireless bridge instead of the computer.
+
+Reference hardware (open hardware, a separate sub-project of ProjectorOS):
+
+| Bridge | Hardware | Notes |
 |---|---|---|
-| macOS | IOHIDManager with device seizing | Needs the Input Monitoring permission |
-| Linux | evdev `EVIOCGRAB` | Straightforward |
-| Windows | Raw Input | Can't hide a device from the OS without an extra driver such as Interception |
+| USB | RP2040 (for example a Raspberry Pi Pico, or a board with a USB-A host port such as Adafruit's Feather RP2040 USB Host) running TinyUSB with Pico-PIO-USB | Full-speed and low-speed USB only, which covers nearly all mice and keyboards; adds about 1 ms of latency |
+| USB, alternative | Teensy 4.1 | Native USB host port; more expensive |
+| Wireless | ESP32 with Bluepad32 | Bluetooth host for mice, keyboards and gamepads; forwards over Wi-Fi or USB serial |
 
-Screen-bound devices for the operator are never seized.
+Existing open-source firmware already covers most of this: **hid-remapper** (RP2040, USB host to USB device HID forwarding) and **Bluepad32** (Bluetooth input host). The ProjectorOS firmware is an adaptation, not new research.
+
+Input provider backends are interchangeable. Everything after them (fusion, binding, tips, routing) doesn't care which backend supplied a device:
+
+| Backend | Platforms | Use |
+|---|---|---|
+| `bridge-usb` | macOS, Linux, Windows | **Recommended default** for tracked devices |
+| `bridge-net` | macOS, Linux, Windows | Wireless bridges; devices far from the machine; multi-machine setups |
+| `seize` | Linux (evdev `EVIOCGRAB`); macOS (IOHIDManager seizing, needs the Input Monitoring permission) | Software fallback with no extra hardware. Not offered on Windows, which would need a third-party kernel driver. |
+
+Screen-bound devices for the operator are never bridged or seized; they stay ordinary OS input.
 
 ### 7.3 Security for input
 
@@ -846,7 +876,8 @@ Goal: reliable interaction on any surface and in any lighting.
 - Graded `video` grants delivered as `MediaStream`, with the console indicator.
 - Camera intrinsics calibration; multiple cameras observing one surface, fused in the broker.
 - Optional: projected-image subtraction for RGB cameras.
-- **Tracked devices**: seizing HID devices on macOS and Linux, camera and HID fusion for tracked mice, projected mouse and keyboard tips, location-based focus for tracked keyboards, binding by motion correlation and prompts, phones bound by an on-screen marker.
+- **Tracked devices**: input provider backends (`bridge-usb`, `bridge-net`, and `seize` as the software fallback), camera and HID fusion for tracked mice, projected mouse and keyboard tips, location-based focus for tracked keyboards, binding by motion correlation and prompts, phones bound by an on-screen marker.
+- **Input bridge sub-project** (open hardware): RP2040 USB bridge firmware first, then an ESP32 wireless bridge; build guide and supported-device list.
 - More input providers (serial, OSC, BLE) and raw-device grants.
 - More marker families as plugins: ARToolKit, ARTag if a usable detector is available, IR-only markers.
 
@@ -883,8 +914,10 @@ Exit criteria: one app spans two edge-blended projectors on a non-flat surface, 
 | Visitor abuse via phones (spam, floods) | Session-scoped anonymous tokens, rate limits, operator kick and lock controls |
 | App authors without hardware | Simulator and recorded sensor sessions from Phase 1 |
 | Biometric data in non-home settings | Out of scope for the first, home-only phase; on-device processing and graded video grants keep the door open |
-| Seizing input devices on Windows needs a third-party driver | Support tracked devices on macOS and Linux first; revisit Windows when there is demand |
-| Off-the-shelf devices with marker stickers vs custom hardware | Open question. Custom hardware with built-in ids or IR LEDs would make binding and tracking much easier; the tangible model supports both |
+| Keeping tracked devices away from the OS | Input bridges make it work the same on every OS with no drivers or permissions; software seizing remains a fallback on Linux and macOS |
+| Bridges are extra hardware per tracked device | Keep them cheap (about $5 to $15 in parts), publish firmware and build guides, and keep the software fallback |
+| Some devices need high-speed USB, or poll faster than the bridge forwards | Rare for mice and keyboards; document supported devices; Teensy-class bridges for edge cases |
+| Off-the-shelf devices with marker stickers vs custom hardware | Input bridges give off-the-shelf devices a built-in identity, so stickers plus bridges are the baseline. Custom hardware with IR LEDs could still improve tracking; the tangible model supports both |
 | Too many enabled marker families slow detection on light hardware | Run only families needed by running apps; per-family rates and regions; cost hints in the hardware profile |
 | Governance of the open-source project as extensions and catalogs appear | Define the extension interfaces and their stability policy before any central service exists |
 
