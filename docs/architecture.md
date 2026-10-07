@@ -279,6 +279,24 @@ Projected content contaminates what an RGB camera sees. This affects capabilitie
 
 IR and stereo hardware is optional. Without it, the broker simply doesn't grant `touch`, and grants `presence` with a quality flag.
 
+**Seeing the projection is also useful: continuous calibration.** Because an RGB camera sees both physical and projected markers, it can check alignment while the system runs, not only during setup. Projectors get bumped, cameras sag on their mounts, and mats get nudged.
+
+- **Physical reference markers** fixed to the surface give the camera-to-surface mapping.
+- **Projected markers**, shown briefly or in the margin outside the usable region, give the output-to-camera mapping.
+- **Comparing the two shows what moved:**
+
+| Observation in the camera image | Likely cause | Correction |
+|---|---|---|
+| Physical and projected markers both shifted the same way | The camera moved | Re-solve camera-to-surface from the physical markers |
+| Projected markers shifted, physical markers didn't | The projector moved | Re-solve the output warp from the projected markers |
+| Physical markers shifted relative to each other or to the surface edges | The surface moved or deformed | Re-solve the surface; flag it to the operator |
+
+- **Tangibles provide a direct alignment check.** A projected outline should sit exactly on its physical object. The offset between a tracked marker and its projected outline is the actual alignment error, measured in millimetres.
+- **No ruler step after the first setup.** Physical reference markers of known size and spacing give scale directly, so recalibration doesn't need a manual measurement.
+- **Small drift is corrected automatically and large drift asks the operator.** Each correction is a new scene version, so it can be undone.
+- **Checks don't disturb apps.** They use the platform layer, run in short windows or at low contrast, and are skipped while an app has requested an uninterrupted surface.
+- **This needs a camera that sees visible light.** An IR-only setup can't see the projection. Such setups keep a small RGB camera for calibration, or project calibration patterns in IR if the hardware supports it.
+
 ### 6.4 Marker families are plugins
 
 Fiducial markers are not one technology. Each **marker family** is a plugin, and the owner chooses which families an installation detects ([issue #8](https://github.com/ProjectorOS/projector-os/issues/8)).
@@ -852,6 +870,7 @@ Goal: run on mini-PCs and Linux, not just a Mac.
 - **Hardware profiling** at startup; ONNX Runtime with per-platform execution providers; graceful degradation of grants.
 - **Supervisor** with auto-start, health checks and restarts; reproducible packaging (installer on macOS, package or image on Linux).
 - Resource governance: watchdogs, frame-time monitoring, rate caps.
+- **Continuous calibration**: physical reference markers plus projected checks detect camera, projector and surface drift; small drift is corrected automatically, large drift alerts the operator.
 - **Input providers** in the backend: gamepads and MIDI as `controls`; device-to-app and device-to-player assignment in the operator console.
 
 Exit criteria: the same apps run on an N100 mini-PC and a Mac, with different grants, unattended for days.
