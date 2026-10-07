@@ -544,7 +544,46 @@ The protocol between processes, and between the platform and apps, is the most i
 
 Rewrites happen one process at a time, behind the protocol.
 
-### 13.3 Platform abstraction
+### 13.3 Shell and backend boundary
+
+Electron is only the shell: windows, app sandboxes, platform UI and the compositor. It is not the backend, and no Python or Rust runs inside it by default. The backend runs as separate processes in any language, which is how the current Python server and Chromium kiosk already work.
+
+```mermaid
+flowchart TB
+  SUP["Supervisor<br/>Python now, Rust later"]
+  subgraph Backend["Backend processes (any language)"]
+    CAPT[Capture service]
+    BRK[Broker and gateway]
+    WK["Capability workers<br/>Python, Rust, ..."]
+  end
+  subgraph Electron["Electron shell (TypeScript)"]
+    MAIN["Main process<br/>windows, sessions, permissions,<br/>offscreen rendering"]
+    REND["App renderers<br/>one sandboxed process per app"]
+    NAT["Optional thin native module<br/>(Rust via napi-rs)"]
+  end
+  SUP -- starts and supervises --> CAPT & BRK & WK
+  SUP -- starts and supervises --> MAIN
+  MAIN --> REND
+  MAIN -- "local WebSocket or Unix socket<br/>(the protocol)" --> BRK
+  MAIN -. uses .-> NAT
+  NAT -. "reads frames<br/>(video grants only)" .-> CAPT
+```
+
+Rules:
+
+- **The supervisor starts Electron, not the other way around.** Electron is one supervised child among the others. This keeps the shell replaceable, lets the backend run headless (for tests, recording sensor sessions and future multi-machine nodes that have no display), and keeps the amount of privileged Node code small.
+- **Electron talks to the backend only through the protocol**, over a local WebSocket or Unix domain socket, exactly as the operator console and other clients do.
+- **Python cannot be embedded in Electron and does not need to be.** In packaged builds, a self-contained Python runtime (built with PyInstaller, or a `uv`-managed runtime) ships alongside the Electron app as a resource, and the supervisor launches it.
+- **Rust has two allowed roles:**
+  - Separate backend processes (supervisor, broker, capture) behind the same protocol. This is the main path.
+  - Thin native modules in Electron's main process, built with `napi-rs`, only for tasks that must happen inside the shell. A crash in such a module takes the shell down with it, so these stay small, and logic belongs in separate processes.
+- **Video is the one boundary that needs a dedicated path.** App renderers cannot read the backend's shared-memory frame bus. When an app is granted `video`, frames reach it as a `MediaStream` through one of two options, to be decided in Phase 4:
+  - A thin native module in the main process reads frames from shared memory and forwards them to the app renderer as WebCodecs `VideoFrame`s, which the SDK wraps in a `MediaStreamTrackGenerator`.
+  - The capture service publishes a local WebRTC stream that the app renderer receives.
+
+  Everything else that apps receive is small, structured data and travels as protocol messages.
+
+### 13.4 Platform abstraction
 
 macOS-specific code today (camera enumeration via `system_profiler`, displays via JXA `NSScreen`, the Chromium launcher) moves behind interfaces with per-OS backends:
 
