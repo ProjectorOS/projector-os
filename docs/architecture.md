@@ -305,9 +305,13 @@ Fiducial markers are not one technology. Each **marker family** is a plugin, and
 |---|---|---|---|
 | **AprilTag** (`apriltag/36h11` and others) | AprilTag 3 C library (BSD); OpenCV's AprilTag dictionaries as a fallback | Integer id | **Default.** Robust, low false-positive rate, good under blur and partial light. 36h11 has 587 ids. |
 | **ArUco** (`aruco/4x4_50` and others) | OpenCV `aruco` | Integer id | Supported today. Kept for existing setups and small markers. |
-| **QR codes** (`qr`) | zxing-cpp (Apache-2.0) or OpenCV's QR detector | String payload | Carries data, not just an id. Slower to decode, so it runs at a lower rate and is tracked between decodes. The same plugin can later cover Micro QR, Data Matrix and Aztec. |
+| **QR codes** (`qr`) | zxing-cpp (Apache-2.0) or OpenCV's QR detector | String payload | Carries data, not just an id. Slower to decode, so it runs at a lower rate and is tracked between decodes. |
+| **Other 2D codes** (`datamatrix`, `aztec`, `pdf417`, `microqr`) | zxing-cpp | String payload | Found on packaging, medicine, shipping labels and tickets. GS1 Data Matrix and GS1 Digital Link QR codes carry product identifiers. |
+| **Product barcodes** (`ean13`, `ean8`, `upca`, `upce`) | zxing-cpp | Product number (GTIN) | Brings **existing product packaging** into the system: groceries, toys, boxed goods. **ISBN** is an EAN-13 starting with 978 or 979, so books are covered too. |
+| **Other 1D barcodes** (`code128`, `code39`, `itf`, `databar`, ...) | zxing-cpp | String payload | Shipping cartons (ITF-14), produce (GS1 DataBar), library and inventory labels |
 | **ARToolKit** (`artoolkit/...`) | ARToolKitX (LGPL), as a separate worker process | Template pattern or matrix code | Template markers allow arbitrary pictures inside the border. |
 | **ARTag** | To be determined | Integer id | Availability and licensing of a detector need checking before committing to it. |
+| **Image targets** (future) | Natural-feature tracking (for example ORB features with homography fitting) | Registered image | Recognizes and tracks printed artwork itself, such as a book cover or a package front, without any code on it |
 | Future | Plugins | Any | Examples: STag, CCTag, circular and nested markers, IR-only markers, retroreflective dots |
 
 **Plugin contract.** A marker-family plugin declares and implements:
@@ -328,12 +332,21 @@ class MarkerFamily(Protocol):
 
 Rules:
 
-- **Marker identity is namespaced**: `apriltag/36h11/7` and `aruco/4x4_50/7` are different markers. QR identities are their payloads (`qr/<payload>`).
+- **Marker identity is namespaced**: `apriltag/36h11/7` and `aruco/4x4_50/7` are different markers. Payload families use their payload (`qr/<payload>`, `ean13/<digits>`).
 - **The platform reserves ids** in its families, for example for calibration patterns. Apps can't claim reserved ids. Calibration moves from ArUco ids 10 to 13 to a reserved AprilTag range.
 - **Only needed families run.** Detectors run for the families that are both enabled by the owner and needed by the platform, the tangible registry or a running app. Each family gets its own rate and can be limited to regions of interest. Payload families decode once, then track the marker cheaply until it's lost.
 - **Cross-family duplicates** are resolved by overlap and quality, because one family's detector can occasionally misread another family's marker.
 - **Apps request families and id ranges** in their manifest, and only see the markers they asked for. A QR app declares a payload filter, such as a URL prefix, so it never sees unrelated codes lying on the table.
-- **QR payloads are untrusted input.** The platform never acts on them (no opening URLs), and they reach apps only through the filter.
+- **Payloads are untrusted input.** The platform never acts on them (no opening URLs), and they reach apps only through the filter.
+
+**Barcodes on existing products** need extra rules, because they weren't designed as tracking markers:
+
+- **They identify a product, not an object.** Two copies of the same book, or two cans of the same soup, carry the same code. The tracker assigns its own instance ids, so apps see `ean13/9780262033848#1` and `#2` as separate objects of the same product.
+- **Identity is normalized.** UPC-A, UPC-E, EAN-8 and EAN-13 all encode a GTIN, so the plugin reports the normalized GTIN-14 alongside the printed symbology. For books it also reports the ISBN, so an app can ask for `isbn` instead of knowing that ISBNs are EAN-13 codes.
+- **Decoding needs resolution, and tracking doesn't.** A retail barcode's narrowest bar is about 0.33 mm. A 1280 px overhead webcam covering a 600 mm surface sees about 0.47 mm per pixel, which is too coarse to decode. So the system **identifies, then tracks**: a product is decoded when it is close to the camera, in a designated scan zone, by a higher-resolution camera, or from a zoomed region of interest. After that it is tracked from the barcode's outline or from the package's own artwork (image targets), with no need to decode again.
+- **1D barcodes give a weaker pose** than square markers: the position and direction of the bars, with a less precise outline. The plugin's quality score says so, and tangibles that need precise placement should still use an AprilTag.
+- **Product information lookups are not part of the core.** Turning a GTIN or ISBN into a name, picture or price needs a database. That is an optional extension or an app with network permission, using sources such as Open Food Facts or Open Library. A fully offline setup still gets the codes.
+- **Some codes carry personal data.** PDF417 on driver's licenses and boarding passes, and barcodes on prescription labels and mail, can contain names and other details. These symbologies are off unless the owner enables them, apps must request each symbology explicitly, and payload filters apply.
 - **Printing.** Plugins that can render markers back the printable endpoint, `/markers/{family}/{id}.png`, plus printable sheets, always with the quiet zone that projection surfaces require.
 - **Packaging.** Python plugins run inside the shared markers worker and register through Python entry points (`projectoros.marker_families`). Plugins in other languages, such as ARToolKit, run as their own worker and send the same `MarkerDetection` messages. Third-party plugins come later, with worker isolation.
 
@@ -855,7 +868,7 @@ Goal: the craft mat becomes the first real app.
 - **Local app store**: install from a folder or archive, enable or disable, per-app permissions in the operator console.
 - Port the craft-mat app to the SDK. Write a second, small sample app to make sure the SDK is not shaped around one app.
 - The **simulator** for developing apps without hardware.
-- **QR code** marker plugin with payload filters in the manifest.
+- **QR and barcode** marker plugin (zxing-cpp) with payload filters in the manifest: QR and other 2D codes, and product barcodes (UPC, EAN, ISBN) with GTIN normalization and instance tracking.
 - **Tangible registry** in the scene: the craft mat's tracked objects become tangibles with footprints, offsets and hotspots.
 - **Screen-bound input** through the shell: mouse and touch as `pointers`, the `keyboard` grant, and the reserved platform key combination.
 
@@ -898,7 +911,8 @@ Goal: reliable interaction on any surface and in any lighting.
 - **Tracked devices**: input provider backends (`bridge-usb`, `bridge-net`, and `seize` as the software fallback), camera and HID fusion for tracked mice, projected mouse and keyboard tips, location-based focus for tracked keyboards, binding by motion correlation and prompts, phones bound by an on-screen marker.
 - **Input bridge sub-project** (open hardware): RP2040 USB bridge firmware first, then an ESP32 wireless bridge; build guide and supported-device list.
 - More input providers (serial, OSC, BLE) and raw-device grants.
-- More marker families as plugins: ARToolKit, ARTag if a usable detector is available, IR-only markers.
+- More marker families as plugins: ARToolKit, ARTag if a usable detector is available, IR-only markers, and **image targets** for tracking packaging and book covers by their artwork.
+- Barcode scan zones and high-resolution regions of interest for decoding product codes from a distance.
 
 Exit criteria: a touch app works over changing projected content on IR-equipped hardware, and is cleanly refused on RGB-only hardware.
 
