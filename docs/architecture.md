@@ -80,6 +80,7 @@ flowchart TB
     W1["Capability worker: markers"]
     W2["Capability worker: hands / pose"]
     W3["Capability worker: presence / touch"]
+    INP["Input providers<br/>HID, gamepad, MIDI, serial, OSC"]
     SCN[("Scene store<br/>calibration, surfaces, units")]
     GW["Gateway<br/>HTTP(S), WebSocket, phone sessions"]
     SHELL["Shell<br/>platform UI + surface compositor"]
@@ -95,6 +96,7 @@ flowchart TB
   CAMS --> CAPT --> FB
   FB --> W1 & W2 & W3
   W1 & W2 & W3 --> BRK
+  DEVS[Input devices] --> INP --> BRK
   SCN --> BRK
   SCN --> SHELL
   BRK --> SB1 & SB2
@@ -146,6 +148,8 @@ Key points:
 - **Surfaces** are named regions apps draw on and receive input in. A surface is a plane (today) or a mesh (later), with its own 2D frame in millimetres, a usable region (today's work-surface rectangle) and an orientation (where "up" is, and the default origin).
 - **Cameras** carry intrinsics and a distortion model when calibrated. A camera that has only been calibrated against a surface by homography is still valid, just less capable.
 - **Outputs** (projectors or displays) map surface coordinates to output pixels through a **warp mesh**. A homography is stored as a 2x2 mesh, so today's calibration is a degenerate case of the general format. Irregular surfaces and keystone correction later only need denser meshes. Each output also carries an optional **blend mask** for overlap regions with other projectors.
+- **Tangibles** are the registry of known physical objects: what marker (or other method) identifies each one, its footprint and hotspot, and optionally the input device bound to it. See section 7.
+- **Marker families** list which fiducial families this installation detects. See section 6.4.
 
 Example (illustrative, not final):
 
@@ -177,6 +181,24 @@ Example (illustrative, not final):
         "mat": { "kind": "mesh", "grid": [2, 2], "points_px": [[0,0],[1920,0],[0,1080],[1920,1080]] }
       },
       "blend_mask": null
+    }
+  },
+  "marker_families": {
+    "enabled": ["apriltag/36h11", "qr"],
+    "reserved": { "apriltag/36h11": { "platform": [580, 586] } }
+  },
+  "tangibles": {
+    "cutting-ruler": {
+      "marker": "apriltag/36h11/3",
+      "footprint_mm": [[0, 0], [300, 0], [300, 40], [0, 40]],
+      "marker_offset_mm": [15, 20]
+    },
+    "keyboard-1": {
+      "marker": "apriltag/36h11/12",
+      "footprint_mm": [[0, 0], [440, 0], [440, 130], [0, 130]],
+      "layout": "ansi-104",
+      "tip": { "offset_mm": [220, -25], "style": "caret" },
+      "device": { "bus": "usb", "vendor_id": "046d", "product_id": "c31c", "serial": "..." }
     }
   }
 }
@@ -233,13 +255,16 @@ An app requests a capability. The broker picks a **provider** that can deliver i
 
 | Capability | What the app gets | Possible providers |
 |---|---|---|
-| `markers` | Fiducial id, position, rotation on a surface | ArUco/AprilTag on RGB or IR |
+| `markers` | Fiducial family, id or payload, position, rotation on a surface | Marker-family plugins (section 6.4) on RGB or IR |
+| `tangibles` | Known physical objects: pose, footprint, hotspot, and input from a bound device | Markers fused with input providers (section 7) |
 | `hands` | Hand landmarks, handedness, on-surface positions | Landmark model on RGB; IR + model |
-| `pointers` | Pointer-Events-like stream: fingertips, pens, laser dots, phone cursors | Derived from hands, blobs, phones |
+| `pointers` | Pointer-Events-like stream: fingertips, pens, laser dots, phone cursors, mice | Derived from hands, blobs, phones, tracked and screen-bound mice |
+| `keyboard` | Key events, routed by focus or by keyboard location | Screen-bound keyboards (shell); tracked keyboards (section 7) |
+| `controls` | Buttons, axes, knobs, notes from gamepads, MIDI and custom devices | Input providers (section 7) |
 | `touch` | True contact vs hover | IR curtain or IR blob; stereo/depth height above surface. Not available on RGB-only hardware. |
 | `presence` | Occupancy, bounding regions, people count | Background model on IR; person segmentation on RGB |
 | `pose` | Body skeletons, 2D or 3D | Pose model; stereo for 3D |
-| `video` | Camera imagery, in graded levels (section 7.3) | Capture service, possibly with segmentation |
+| `video` | Camera imagery, in graded levels (section 8.3) | Capture service, possibly with segmentation |
 
 New capabilities and providers are added as worker plugins with a declared contract: the capability's schema, sensor requirements and cost per frame. First-party providers come first; third-party providers are a later phase and run with the same isolation as workers.
 
@@ -254,9 +279,141 @@ Projected content contaminates what an RGB camera sees. This affects capabilitie
 
 IR and stereo hardware is optional. Without it, the broker simply doesn't grant `touch`, and grants `presence` with a quality flag.
 
-## 7. Capability broker and grants
+### 6.4 Marker families are plugins
 
-### 7.1 Negotiation
+Fiducial markers are not one technology. Each **marker family** is a plugin, and the owner chooses which families an installation detects ([issue #8](https://github.com/ProjectorOS/projector-os/issues/8)).
+
+| Family | Plugin backend | Identity | Notes |
+|---|---|---|---|
+| **AprilTag** (`apriltag/36h11` and others) | AprilTag 3 C library (BSD); OpenCV's AprilTag dictionaries as a fallback | Integer id | **Default.** Robust, low false-positive rate, good under blur and partial light. 36h11 has 587 ids. |
+| **ArUco** (`aruco/4x4_50` and others) | OpenCV `aruco` | Integer id | Supported today. Kept for existing setups and small markers. |
+| **QR codes** (`qr`) | zxing-cpp (Apache-2.0) or OpenCV's QR detector | String payload | Carries data, not just an id. Slower to decode, so it runs at a lower rate and is tracked between decodes. The same plugin can later cover Micro QR, Data Matrix and Aztec. |
+| **ARToolKit** (`artoolkit/...`) | ARToolKitX (LGPL), as a separate worker process | Template pattern or matrix code | Template markers allow arbitrary pictures inside the border. |
+| **ARTag** | To be determined | Integer id | Availability and licensing of a detector need checking before committing to it. |
+| Future | Plugins | Any | Examples: STag, CCTag, circular and nested markers, IR-only markers, retroreflective dots |
+
+**Plugin contract.** A marker-family plugin declares and implements:
+
+```python
+class MarkerFamily(Protocol):
+    key: str                           # "apriltag/36h11", "aruco/4x4_50", "qr"
+    id_kind: Literal["int", "payload"]
+    id_range: tuple[int, int] | None   # None for payload families
+    sensors: set[str]                  # {"rgb", "ir"}
+    cost_hint_ms: float                # per 1 MP frame on a reference machine
+
+    def detect(self, gray: np.ndarray, rois: list[Rect] | None) -> list[MarkerDetection]: ...
+    def render(self, id: int | str, size_px: int, quiet_zone_px: int) -> np.ndarray | None: ...
+```
+
+`MarkerDetection` carries the family key, the id or payload, the four corners in camera pixels in a canonical order, a quality score from 0 to 1, and family-specific extras such as Hamming distance. Everything after detection (mapping to surfaces, pose, filtering, occlusion handling, tangibles) is shared and does not depend on the family.
+
+Rules:
+
+- **Marker identity is namespaced**: `apriltag/36h11/7` and `aruco/4x4_50/7` are different markers. QR identities are their payloads (`qr/<payload>`).
+- **The platform reserves ids** in its families, for example for calibration patterns. Apps can't claim reserved ids. Calibration moves from ArUco ids 10 to 13 to a reserved AprilTag range.
+- **Only needed families run.** Detectors run for the families that are both enabled by the owner and needed by the platform, the tangible registry or a running app. Each family gets its own rate and can be limited to regions of interest. Payload families decode once, then track the marker cheaply until it's lost.
+- **Cross-family duplicates** are resolved by overlap and quality, because one family's detector can occasionally misread another family's marker.
+- **Apps request families and id ranges** in their manifest, and only see the markers they asked for. A QR app declares a payload filter, such as a URL prefix, so it never sees unrelated codes lying on the table.
+- **QR payloads are untrusted input.** The platform never acts on them (no opening URLs), and they reach apps only through the filter.
+- **Printing.** Plugins that can render markers back the printable endpoint, `/markers/{family}/{id}.png`, plus printable sheets, always with the quiet zone that projection surfaces require.
+- **Packaging.** Python plugins run inside the shared markers worker and register through Python entry points (`projectoros.marker_families`). Plugins in other languages, such as ARToolKit, run as their own worker and send the same `MarkerDetection` messages. Third-party plugins come later, with worker isolation.
+
+## 7. Input devices and tangibles
+
+Not every input comes from cameras or phones. Mice, keyboards, gamepads, MIDI controllers, knobs and custom devices can take part too, either as ordinary screen-bound devices or as **tangibles**: physical objects at a known place in the scene that also produce input.
+
+### 7.1 Input sources and routing
+
+```mermaid
+flowchart LR
+  subgraph Sources
+    S1["Sensing<br/>cameras, capability workers"]
+    S2["Phones<br/>via gateway"]
+    S3["Screen-bound devices<br/>operator mouse and keyboard, via shell"]
+    S4["Input providers<br/>seized HID, gamepad, MIDI, serial, OSC, BLE"]
+  end
+  S1 & S2 & S3 & S4 --> R["Broker input router<br/>fusion, binding, focus, grants"]
+  R --> A1[App A]
+  R --> A2[App B]
+  R --> PUI["Platform UI<br/>(never visible to apps)"]
+```
+
+Everything goes through the broker's input router, including devices plugged into the machine. This matters for the rendering pipeline: in stage B (section 10), apps render offscreen and never receive native input, so the platform has to route input to them anyway. Routing through the broker from the start keeps app behavior the same in every stage.
+
+There are two kinds of local device:
+
+| Kind | Example | Captured by | Routed by |
+|---|---|---|---|
+| **Screen-bound** | The operator's mouse and keyboard; a touchscreen on a display output | The shell (Electron), as normal OS input | Spatial input through the inverse warp to surface coordinates; keys by focus |
+| **Tracked** | A mouse or keyboard on the table with a marker on it | A backend input provider that takes the device exclusively | Its physical pose (section 7.2) |
+
+Input routing rules:
+
+- **Spatial input** (pointers from any source) goes to the app that owns the surface at that point, in that app's units.
+- **Non-spatial input** (keys, buttons, MIDI) goes to the app with focus, to an app the operator explicitly assigned the device to, or, for tracked devices, to the app at the device's location.
+- **The platform draws all cursors**: screen-bound cursors and the projected tips of tracked devices (section 7.2), so they stay correct across surfaces, warps and blended overlaps.
+- **Devices can be assigned to players or seats**, so an app sees "player 2" whether that's a gamepad, a phone, a tracked mouse or a tracked hand.
+
+### 7.2 Tangibles
+
+A tangible combines up to two things:
+
+- **Where it is:** a pose from a marker (any family in section 6.4), IR LEDs, a depth or shape model, or none at all.
+- **What it sends:** an event stream from HID, MIDI, serial, BLE, OSC or a phone, or none at all.
+
+The craft mat's tracked objects are tangibles with a pose and no data stream. A keyboard with a marker is a tangible with both. Tangibles are registered in the scene (section 4) with a footprint, a marker offset, an optional **hotspot** (the point that acts as the pointer, such as the front of a mouse) and an optional key layout. Apps receive them through the `tangibles` capability, and their input also appears in `pointers`, `keyboard` and `controls`.
+
+**Tracked mice: fuse camera and HID.**
+
+| Source | Strength | Weakness |
+|---|---|---|
+| Camera via marker | Absolute position and rotation | About 30 Hz, around 100 ms of latency, lost whenever a hand covers the marker |
+| HID sensor | Up to 1000 Hz, very low latency | Relative only; drifts |
+
+The router fuses both with a filter. HID deltas drive responsiveness, and camera poses correct position and drift. HID counts are converted to millimetres with a scale learned by comparing HID motion with the camera track, and rotated into the surface frame using the mouse's current angle. When a hand covers the marker, HID dead-reckoning keeps the mouse tracked. The resulting pointer is reported at the hotspot as `pointerType: 'mouse'` with `tracked: true`.
+
+**Tracked keyboards: location is focus.** Keystrokes go to the app, and optionally to the input zone or object, nearest the keyboard. Two people at two keyboards type into two different places without clicking to focus. If the layout is known, apps can project onto the keys themselves.
+
+**Projected tips: the projection extends the device.** A tracked mouse or keyboard has no on-screen cursor. Instead, the platform projects its **tip** onto the surface, attached to the physical device:
+
+- A **mouse tip** is projected at the mouse's hotspot, ahead of its front edge, so the hand and the device itself don't cover it. It moves and rotates with the mouse at the fused HID rate, so it feels attached to the device and doesn't trail behind the camera.
+- A **keyboard tip** is projected in front of the keyboard and shows where typing goes: a caret, the current focus target, or a line leading to it. This answers "where will my typing go?" directly on the table.
+- Tips are part of the **trusted platform layer**, like a system cursor, and always render above apps, so an app can't hide or fake where a device points. Apps can choose a tip style from a platform-provided set (like CSS `cursor`), and can hide it only while the device is over their own surface.
+- The tip offset, size and style are stored per tangible in the scene, so each device can be tuned once.
+- Tips also confirm binding. When a device is bound, its tip appears. A device with a marker but no tip is visibly not bound yet.
+
+**Binding a device to its marker.** The platform has to learn which HID device belongs to which marker:
+
+- **Motion correlation:** move a mouse, and the router matches its HID motion against marker motion.
+- **Prompt:** the platform projects "press any key" next to a newly seen keyboard marker, and the keyboard that responds is bound to it.
+- **Manually** in the operator console.
+
+Bindings are stored in the tangible registry, so a known device is recognized whenever its marker appears. A phone can bind itself with no setup by showing a marker on its own screen.
+
+**Taking devices away from the OS.** A tracked mouse must not move the system cursor, and a tracked keyboard must not type into the focused window. Input providers take tracked devices exclusively:
+
+| OS | Mechanism | Note |
+|---|---|---|
+| macOS | IOHIDManager with device seizing | Needs the Input Monitoring permission |
+| Linux | evdev `EVIOCGRAB` | Straightforward |
+| Windows | Raw Input | Can't hide a device from the OS without an extra driver such as Interception |
+
+Screen-bound devices for the operator are never seized.
+
+### 7.3 Security for input
+
+- **Keyboard input is a capability** (`keyboard`) that the owner grants per app. Otherwise any app could log keystrokes meant for the platform.
+- **A reserved key combination always reaches the platform** to open the operator overlay, pause apps or exit. Apps can't intercept it. Input to platform UI is never forwarded to apps, and apps can't send synthetic input to the platform.
+- **Raw device access is a separate, higher-trust grant.** Apps get brokered events by default. Raw access through WebHID, WebSerial, WebMIDI, WebUSB or Web Bluetooth (which Electron routes to its main process for permission) is granted only for one specific device the owner picks.
+
+### 7.4 Outputs use the same model
+
+Lights (DMX or smart bulbs), sound, relays and haptics are **output providers**: the same pattern in reverse, reached through granted capabilities. A device can be both a tangible and an output, such as a lamp whose location is known. Output providers are a later phase, but they use the same provider, binding and grant mechanisms.
+
+## 8. Capability broker and grants
+
+### 8.1 Negotiation
 
 ```mermaid
 flowchart LR
@@ -274,7 +431,7 @@ flowchart LR
 - An **extension policy** is optional. A future paid tier, for example, is just another policy input, and the core works without any.
 - If a required capability can't be granted, the app doesn't start, and the operator sees why. Otherwise the app starts with the best grant and receives `grant.changed` events if conditions change.
 
-### 7.2 Manifest
+### 8.2 Manifest
 
 ```json
 {
@@ -288,6 +445,7 @@ flowchart LR
   "surface": { "units": "normalized", "fit": "contain", "min_size_mm": [400, 300] },
   "capabilities": {
     "hands":   { "required": true, "rate_hz": { "min": 15, "ideal": 30 } },
+    "markers": { "required": false, "families": { "apriltag/36h11": { "ids": [0, 49] }, "qr": { "payload_prefix": "https://example.org/wall/" } } },
     "presence": { "required": false },
     "video":   { "required": false, "level": "silhouette" }
   },
@@ -299,7 +457,7 @@ flowchart LR
 
 The grant mirrors the request with actual values, including measured latency for the interaction class, so apps can adapt instead of guessing.
 
-### 7.3 Video access levels
+### 8.3 Video access levels
 
 Raw imagery is the most sensitive capability, so it is graded. Each level is a separate permission:
 
@@ -310,7 +468,7 @@ Raw imagery is the most sensitive capability, so it is graded. Each level is a s
 
 Video is delivered as a standard `MediaStream`, so apps use ordinary web APIs. The space owner grants these levels, and the platform shows a persistent indicator on the operator console while any app is receiving video.
 
-### 7.4 Hardware tiers and interaction classes
+### 8.4 Hardware tiers and interaction classes
 
 Hardware tiers are descriptive, not product SKUs:
 
@@ -330,16 +488,16 @@ Developers target **interaction classes**:
 
 The system measures its own **photon-to-photon latency**: it projects a timed pattern and detects it with the camera. This runs during calibration and on demand, and the result is part of the hardware profile.
 
-## 8. Apps and sandboxing
+## 9. Apps and sandboxing
 
-### 8.1 Package and store
+### 9.1 Package and store
 
 An app is a static web bundle (HTML, JS, WASM, assets) plus `manifest.json`, distributed as a single archive. No server-side code runs on the device for an app.
 
 - **Phase 1: local store.** The owner installs apps from a file, a folder (developer mode) or a URL. The store keeps versions and the owner's permission decisions.
 - **Later: catalogs.** Any number of catalog sources (a self-hosted list, a community index, an optional central catalog). Packages can be signed, and the owner can require signatures. Catalogs are an extension, not a core dependency.
 
-### 8.2 Isolation
+### 9.2 Isolation
 
 ```mermaid
 flowchart TB
@@ -366,9 +524,9 @@ flowchart TB
 - The **shell** is trusted and separate. Platform UI renders above all apps. Apps cannot draw outside their surface region.
 - **Resource governance:** per-app frame-time and memory monitoring, a watchdog that reloads a hung app, and rate caps on everything an app can send. On light hardware the broker lowers capability rates before the platform itself is starved.
 
-The shell is built on **Electron**, for three reasons: one pinned Chromium on macOS, Linux and Windows; per-app process and session isolation; and offscreen rendering with shared GPU textures, which the warp compositor in section 9 needs. Tauri is not an option because it uses three different engines on three OSes and cannot capture app pixels. This assumption should be confirmed with a technical spike before Phase 5.
+The shell is built on **Electron**, for three reasons: one pinned Chromium on macOS, Linux and Windows; per-app process and session isolation; and offscreen rendering with shared GPU textures, which the warp compositor in section 10 needs. Tauri is not an option because it uses three different engines on three OSes and cannot capture app pixels. This assumption should be confirmed with a technical spike before Phase 5.
 
-### 8.3 App lifecycle
+### 9.3 App lifecycle
 
 ```mermaid
 stateDiagram-v2
@@ -386,7 +544,7 @@ stateDiagram-v2
   Blocked --> Installed: dismiss
 ```
 
-## 9. Rendering and output
+## 10. Rendering and output
 
 Apps draw onto **surfaces**. Only the shell knows about outputs.
 
@@ -412,7 +570,7 @@ This is delivered in two stages, both behind the same app contract:
 
 Moving from A to B changes nothing for apps, because apps never see output pixels in either stage. Projector-side calibration for Stage B uses structured light (Gray-code patterns) to solve dense projector-to-camera correspondences, which also produces the warp meshes.
 
-## 10. SDK
+## 11. SDK
 
 The SDK is an ES module. It is the only public API for apps, and it is versioned with the protocol.
 
@@ -425,13 +583,20 @@ console.log(pos.grant.capabilities.hands);  // { rate_hz: 30, latency_ms: 85, pr
 
 // Pointer-Events-like input from every source.
 surface.addEventListener('pointerdown', (e) => {
-  // e.pointerType: 'hand' | 'marker' | 'blob' | 'phone'
+  // e.pointerType: 'hand' | 'marker' | 'blob' | 'phone' | 'mouse' | 'pen' | 'touch'
   spawn(e.x, e.y, e.pointerType);
 });
 
 // Capability streams.
 pos.capabilities.markers.addEventListener('update', (e) => {
-  for (const m of e.markers) placeLabel(m.id, m.x, m.y, m.angle);
+  // m.family: 'apriltag/36h11' | 'qr' | ...; m.id is a number, or m.payload for payload families
+  for (const m of e.markers) placeLabel(m.family, m.id ?? m.payload, m.x, m.y, m.angle);
+});
+
+// Tangibles: known objects, with input from a bound device if any.
+pos.capabilities.tangibles.addEventListener('keydown', (e) => {
+  // e.tangible: { id: 'keyboard-1', x, y, angle }; routed here because the keyboard sits on this app's surface
+  typeInto(nearestField(e.tangible.x, e.tangible.y), e.key);
 });
 
 // Prediction compensates for measured latency.
@@ -452,12 +617,12 @@ if (pos.grant.capabilities.video?.level === 'silhouette') {
 Design rules:
 
 - Use web-platform shapes: `EventTarget`, Pointer Events semantics, `MediaStream`, promises.
-- Everything is typed. Types are generated from the protocol schema (section 13), not hand-written.
+- Everything is typed. Types are generated from the protocol schema (section 14), not hand-written.
 - A **simulator** ships with the SDK: apps can be developed in a normal browser with mouse input standing in for hands and markers, and recorded sensor sessions can be replayed. Most app authors will not own a projector rig.
 
-## 11. Networking and phones
+## 12. Networking and phones
 
-### 11.1 Local-first networking
+### 12.1 Local-first networking
 
 By default the device serves everything on the local network. No internet connection is needed for any part of a core installation.
 
@@ -476,7 +641,7 @@ flowchart LR
   P2[Phone on cellular] -.-> R -.-> D
 ```
 
-### 11.2 Zero-effort phone join
+### 12.2 Zero-effort phone join
 
 1. The shell projects a QR code (or the operator console shows one) containing the session URL and a short-lived join code.
 2. The visitor scans it. The app's **companion page** opens in the phone's browser. No install, no account.
@@ -485,7 +650,7 @@ flowchart LR
 
 The companion page is part of the app package, so app authors build both sides of their experience. It is sandboxed by origin like the surface view.
 
-### 11.3 HTTPS without assuming a cloud
+### 12.3 HTTPS without assuming a cloud
 
 Many web APIs (device orientation, camera, service workers, WebAuthn, clipboard) require a secure context. Plain HTTP on a LAN works for basic touch and buttons, but not for those. There is no zero-effort way to get a publicly trusted certificate on a fully offline device, so HTTPS is tiered:
 
@@ -498,7 +663,7 @@ Many web APIs (device orientation, camera, service workers, WebAuthn, clipboard)
 
 Remote access for cellular phones is an extension with pluggable providers. The core never depends on a specific one.
 
-### 11.4 Audience scale
+### 12.4 Audience scale
 
 | Profile | Audience | Transport | Notes |
 |---|---|---|---|
@@ -506,7 +671,7 @@ Remote access for cellular phones is an extension with pluggable providers. The 
 | Room | 15 to 100 | Local WebSocket with input throttling and server-side aggregation | Remote participants via a remote-access extension |
 | Broadcast | 100 to 10,000+ | Requires an extension: edge aggregation of inputs, and video out via WebRTC (WHEP) | Not part of the core; designed as an extension that uses the same session protocol |
 
-## 12. Extensions
+## 13. Extensions
 
 Everything that is optional is an **extension** behind an interface defined by the core. The core ships with a null implementation of each, so no extension is required.
 
@@ -519,13 +684,13 @@ Everything that is optional is an **extension** behind an interface defined by t
 | App catalogs | Local installs only | Self-hosted catalogs, community index, optional central catalog |
 | Payments and licensing | None | Any vendor's licensing service |
 | Telemetry | None, ever, by default | Opt-in, self-hostable |
-| Capability providers | First-party providers | Third-party sensing plugins |
+| Capability providers | First-party providers | Third-party sensing plugins, marker families, input and output providers |
 
 This is also the boundary for any future monetization: optional services implement extension interfaces. The open-source core stays complete without them.
 
-## 13. Protocol and process architecture
+## 14. Protocol and process architecture
 
-### 13.1 Protocol first
+### 14.1 Protocol first
 
 The protocol between processes, and between the platform and apps, is the most important long-lived artifact. It should be **schema-first**: one source of truth that generates Python (Pydantic), TypeScript and Rust types. This replaces today's hand-mirroring of `server/protocol.py` and `ui/src/types.ts`.
 
@@ -534,7 +699,7 @@ The protocol between processes, and between the platform and apps, is the most i
 - A compact binary encoding (for example CBOR or MessagePack) is optional for high-rate streams, negotiated per connection.
 - The protocol, the manifest and the scene format each have a version and a compatibility policy.
 
-### 13.2 Languages
+### 14.2 Languages
 
 | Component | Language now | Later |
 |---|---|---|
@@ -544,7 +709,7 @@ The protocol between processes, and between the platform and apps, is the most i
 
 Rewrites happen one process at a time, behind the protocol.
 
-### 13.3 Shell and backend boundary
+### 14.3 Shell and backend boundary
 
 Electron is only the shell: windows, app sandboxes, platform UI and the compositor. It is not the backend, and no Python or Rust runs inside it by default. The backend runs as separate processes in any language, which is how the current Python server and Chromium kiosk already work.
 
@@ -583,7 +748,7 @@ Rules:
 
   Everything else that apps receive is small, structured data and travels as protocol messages.
 
-### 13.4 Platform abstraction
+### 14.4 Platform abstraction
 
 macOS-specific code today (camera enumeration via `system_profiler`, displays via JXA `NSScreen`, the Chromium launcher) moves behind interfaces with per-OS backends:
 
@@ -594,7 +759,7 @@ macOS-specific code today (camera enumeration via `system_profiler`, displays vi
 | Shell launch | Electron | Electron (kiosk session) | Electron |
 | Service management | launchd | systemd | Windows service |
 
-## 14. Multi-machine (later)
+## 15. Multi-machine (later)
 
 Some installations need several machines, for example one per wall. The model: one **coordinator** owns the scene and the broker; other nodes run capture, workers and shells, and register with it. The same protocol runs over the network. A message bus with both shared-memory and network transports (Zenoh is a candidate) fits here.
 
@@ -604,7 +769,7 @@ Caveats to carry into that design:
 - Synchronized output across machines needs genlock-capable GPUs or is approximate.
 - Apps spanning machines see one logical surface. The coordinator, not the app, deals with the split.
 
-## 15. Phased plan
+## 16. Phased plan
 
 Each phase leaves the system usable, keeps the craft-mat app working, and preserves the seams later phases need.
 
@@ -628,8 +793,9 @@ Goal: fix the things that are cheap now and expensive later.
 - Carry **capture timestamps** through all events.
 - Move detection off the asyncio loop into **worker processes** reading frames from shared memory.
 - Add **photon-to-photon latency measurement** to calibration.
+- **Marker-family plugin interface** (section 6.4), with ArUco ported as the first plugin and **AprilTag 36h11 added and made the default** ([issue #8](https://github.com/ProjectorOS/projector-os/issues/8)). Namespaced marker identities, family selection in the operator console, printable markers per family, and calibration moved to a reserved AprilTag range.
 
-Exit criteria: the craft mat behaves as today; latency is measured and shown; the protocol types are generated.
+Exit criteria: the craft mat behaves as today; latency is measured and shown; the protocol types are generated; AprilTag and ArUco objects can be tracked side by side.
 
 ### Phase 1: Platform / app split
 
@@ -641,6 +807,9 @@ Goal: the craft mat becomes the first real app.
 - **Local app store**: install from a folder or archive, enable or disable, per-app permissions in the operator console.
 - Port the craft-mat app to the SDK. Write a second, small sample app to make sure the SDK is not shaped around one app.
 - The **simulator** for developing apps without hardware.
+- **QR code** marker plugin with payload filters in the manifest.
+- **Tangible registry** in the scene: the craft mat's tracked objects become tangibles with footprints, offsets and hotspots.
+- **Screen-bound input** through the shell: mouse and touch as `pointers`, the `keyboard` grant, and the reserved platform key combination.
 
 Exit criteria: the craft mat runs as a packaged app through the public SDK only; a third party could build an app from the docs and the simulator.
 
@@ -653,6 +822,7 @@ Goal: run on mini-PCs and Linux, not just a Mac.
 - **Hardware profiling** at startup; ONNX Runtime with per-platform execution providers; graceful degradation of grants.
 - **Supervisor** with auto-start, health checks and restarts; reproducible packaging (installer on macOS, package or image on Linux).
 - Resource governance: watchdogs, frame-time monitoring, rate caps.
+- **Input providers** in the backend: gamepads and MIDI as `controls`; device-to-app and device-to-player assignment in the operator console.
 
 Exit criteria: the same apps run on an N100 mini-PC and a Mac, with different grants, unattended for days.
 
@@ -662,7 +832,7 @@ Goal: zero-effort phone participation.
 
 - Companion pages in app packages; QR join; anonymous session tokens; gateway rate limiting.
 - Phone pointers merged into the `pointers` capability.
-- HTTPS modes from section 11.3: plain local and owner domain first.
+- HTTPS modes from section 12.3: plain local and owner domain first.
 - First remote-access extension (one provider, behind the generic interface).
 
 Exit criteria: a visitor joins from a phone by scanning a QR code with no install; optionally, from cellular through an extension.
@@ -676,6 +846,9 @@ Goal: reliable interaction on any surface and in any lighting.
 - Graded `video` grants delivered as `MediaStream`, with the console indicator.
 - Camera intrinsics calibration; multiple cameras observing one surface, fused in the broker.
 - Optional: projected-image subtraction for RGB cameras.
+- **Tracked devices**: seizing HID devices on macOS and Linux, camera and HID fusion for tracked mice, projected mouse and keyboard tips, location-based focus for tracked keyboards, binding by motion correlation and prompts, phones bound by an on-screen marker.
+- More input providers (serial, OSC, BLE) and raw-device grants.
+- More marker families as plugins: ARToolKit, ARTag if a usable detector is available, IR-only markers.
 
 Exit criteria: a touch app works over changing projected content on IR-equipped hardware, and is cleanly refused on RGB-only hardware.
 
@@ -694,12 +867,13 @@ Exit criteria: one app spans two edge-blended projectors on a non-flat surface, 
 ### Phase 6: Ecosystem and multi-machine
 
 - App catalogs as extensions; package signing; owner policies requiring signatures.
-- Third-party capability providers with worker isolation.
+- Third-party capability providers, marker families and input providers, with worker isolation.
+- **Output providers**: lights, sound, relays, haptics.
 - Optional extensions: identity, policy tiers, payments, broadcast-scale audiences.
 - Multi-machine coordinator model.
 - Rust rewrites of the supervisor, broker and capture service, where packaging or reliability shows the need.
 
-## 16. Risks and open questions
+## 17. Risks and open questions
 
 | Risk or question | Mitigation or next step |
 |---|---|
@@ -709,6 +883,9 @@ Exit criteria: one app spans two edge-blended projectors on a non-flat surface, 
 | Visitor abuse via phones (spam, floods) | Session-scoped anonymous tokens, rate limits, operator kick and lock controls |
 | App authors without hardware | Simulator and recorded sensor sessions from Phase 1 |
 | Biometric data in non-home settings | Out of scope for the first, home-only phase; on-device processing and graded video grants keep the door open |
+| Seizing input devices on Windows needs a third-party driver | Support tracked devices on macOS and Linux first; revisit Windows when there is demand |
+| Off-the-shelf devices with marker stickers vs custom hardware | Open question. Custom hardware with built-in ids or IR LEDs would make binding and tracking much easier; the tangible model supports both |
+| Too many enabled marker families slow detection on light hardware | Run only families needed by running apps; per-family rates and regions; cost hints in the hardware profile |
 | Governance of the open-source project as extensions and catalogs appear | Define the extension interfaces and their stability policy before any central service exists |
 
 ## Appendix: from today's code to the target
@@ -718,9 +895,10 @@ Exit criteria: one app spans two edge-blended projectors on a non-flat surface, 
 | `server/main.py` mode state machine and run loop | Supervisor, broker and gateway; the frame loop moves into the capture service and workers |
 | `server/camera.py` | Capture service |
 | `server/cameras.py`, `server/displays.py`, `server/launcher.py` | Platform abstraction, macOS backend |
-| `server/detection.py` (ArUco, MediaPipe hands) | `markers` and `hands` capability workers |
+| `server/detection.py` (ArUco, MediaPipe hands) | `markers` worker with the ArUco marker-family plugin; `hands` capability worker |
 | `server/calibration.py`, `data/calibration.json`, `data/work_surface.json` | Scene store and calibration tools; the work surface becomes a surface's usable region |
 | `server/protocol.py`, `ui/src/types.ts` | Generated from the protocol schema |
 | `ui/src/projector/` | Shell: platform overlays, calibration patterns, surface mapping |
-| Tracked-object overlays, hand overlay, glue logic | The craft-mat app (overlays), and broker-side tracking (glue and occlusion handling become part of `markers` tracking) |
+| Tracked-object overlays, hand overlay, glue logic | The craft-mat app (overlays); tracked objects become entries in the tangible registry; glue and occlusion handling move into broker-side tangible tracking |
 | `ui/index.html` control panel | Operator console |
+| `/markers/{id}.png` endpoint | `/markers/{family}/{id}.png`, rendered by marker-family plugins |
