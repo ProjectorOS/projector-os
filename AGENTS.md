@@ -87,6 +87,7 @@ Client-side (localStorage, prefix `projectoros.`): `workSurfaceCollapsed`, `prev
 - **Comments:** explain *why*, not *what*. Most code doesn't need any. The existing comments in [ui/src/overlay.ts](ui/src/overlay.ts) and [ui/src/calibration.ts](ui/src/calibration.ts) are good examples — they explain non-obvious choices (angle convention, quiet-zone reasoning, label offset).
 - **Pydantic v2** for all server protocol types in [server/protocol.py](server/protocol.py). Mirror types in [ui/src/types.ts](ui/src/types.ts) by hand — keep the two in sync when adding events/commands.
 - **Imperial units:** `parseLengthMm` in [ui/src/control.ts](ui/src/control.ts) accepts mm/cm/m/in/inch/inches/"/ft/foot/feet/'. Use it for any user-entered length, not just calibration.
+- **Commit + PR messages:** write the body to a temp file (e.g. `/tmp/pr_body.md`) and pass it via `git commit -F <file>` / `gh pr create --body-file <file>`. Inline heredocs and long `-m` strings choke on quotes and newlines through bash; the file path doesn't.
 
 ## Gotchas worth knowing
 

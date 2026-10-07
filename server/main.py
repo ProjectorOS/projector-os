@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from server import camera_roi as cam_roi_persist
 from server import preferences as prefs_persist
 from server import work_surface as ws_persist
 from server.bus import Bus
@@ -41,6 +42,8 @@ from server.protocol import (
     CalibrationPromptEvent,
     CalibrationUpdatedEvent,
     CameraChangedEvent,
+    CameraRoi,
+    CameraRoiUpdatedEvent,
     DetectedHand,
     DetectedObject,
     DetectionsEvent,
@@ -63,6 +66,7 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 CALIBRATION_PATH = DATA_DIR / "calibration.json"
 WORK_SURFACE_PATH = DATA_DIR / "work_surface.json"
 PREFERENCES_PATH = DATA_DIR / "preferences.json"
+CAMERA_ROI_PATH = DATA_DIR / "camera_roi.json"
 # Keep a tracked object on the projection for this long after its marker stops being
 # detected. Smooths over single-frame detection misses (occlusion by a hand, motion
 # blur, glare) so objects don't flicker on/off.
@@ -256,6 +260,10 @@ class AppState:
         self.mode: Mode = "track" if self.calibration is not None else "idle"
         self.projector_dims: tuple[int, int] | None = None
         self.work_surface: WorkSurface | None = ws_persist.load(WORK_SURFACE_PATH)
+        # User-defined polygon on the camera frame (4 cam_px corners). No
+        # server-side consumer yet — purely an annotation surfaced via the
+        # camera card UI. None until the user defines one.
+        self.camera_roi: CameraRoi | None = cam_roi_persist.load(CAMERA_ROI_PATH)
         self.camera_index: int | None = None
         self.launcher = ProjectorLauncher()
         self.preferences = prefs_persist.load(PREFERENCES_PATH)
@@ -453,6 +461,43 @@ class AppState:
             self.preferences.show_work_surface_outline = show_outline
             prefs_persist.save(self.preferences, PREFERENCES_PATH)
         await self._broadcast_work_surface()
+
+    async def set_camera_roi(
+        self,
+        corners: list[list[float]],
+        clear: bool,
+        enabled: bool | None = None,
+    ) -> None:
+        # Three messages: clear (drop everything), update corners (replace
+        # polygon, preserve enabled unless explicitly given), and toggle
+        # enabled (no corners, just flip the visibility flag).
+        if clear:
+            self.camera_roi = None
+        elif len(corners) == 4:
+            new_enabled = (
+                enabled
+                if enabled is not None
+                else (self.camera_roi.enabled if self.camera_roi else True)
+            )
+            self.camera_roi = CameraRoi(
+                corners=[[float(p[0]), float(p[1])] for p in corners],
+                enabled=bool(new_enabled),
+                updated_at=time.time(),
+            )
+        elif enabled is not None and self.camera_roi is not None:
+            self.camera_roi = CameraRoi(
+                corners=self.camera_roi.corners,
+                enabled=bool(enabled),
+                updated_at=time.time(),
+            )
+        else:
+            # Nothing to apply (no corners, no clear, no enabled-only on a
+            # polygon). Treat as a no-op.
+            return
+        cam_roi_persist.save(self.camera_roi, CAMERA_ROI_PATH)
+        await self.bus.broadcast(
+            CameraRoiUpdatedEvent(camera_roi=self.camera_roi)
+        )
 
     async def _broadcast_work_surface(self) -> None:
         if self.work_surface is None:
@@ -760,6 +805,105 @@ async def camera_preview():
     )
 
 
+def _warp_camera_roi(frame: np.ndarray, roi: CameraRoi) -> np.ndarray | None:
+    """Project the camera frame through H_polygon→rectangle so the ROI's
+    4 corners map to the corners of an output image. The output dimensions
+    are the average of opposite edge lengths so the polygon's apparent
+    aspect ratio is preserved.
+
+    Returns None when the polygon is too small, malformed, or
+    cv2.getPerspectiveTransform fails.
+    """
+    if frame is None or frame.size == 0:
+        return None
+    corners = np.array(roi.corners, dtype=np.float32)
+    if corners.shape != (4, 2):
+        return None
+    tl, tr, br, bl = corners
+    top_w = float(np.linalg.norm(tr - tl))
+    bot_w = float(np.linalg.norm(br - bl))
+    left_h = float(np.linalg.norm(bl - tl))
+    right_h = float(np.linalg.norm(br - tr))
+    out_w = int(round((top_w + bot_w) / 2.0))
+    out_h = int(round((left_h + right_h) / 2.0))
+    if out_w < 50 or out_h < 50:
+        return None
+    # Cap output size so warping a tiny polygon to a huge rectangle doesn't
+    # cost gigabytes of pixels. 2000 px on the long side is plenty for a
+    # preview <img>.
+    cap = 2000
+    if max(out_w, out_h) > cap:
+        scale = cap / max(out_w, out_h)
+        out_w = max(50, int(round(out_w * scale)))
+        out_h = max(50, int(round(out_h * scale)))
+    target = np.array(
+        [[0, 0], [out_w, 0], [out_w, out_h], [0, out_h]],
+        dtype=np.float32,
+    )
+    try:
+        h_mat = cv2.getPerspectiveTransform(corners, target)
+        warped = cv2.warpPerspective(
+            frame,
+            h_mat,
+            (out_w, out_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0),
+        )
+    except cv2.error:
+        return None
+    return warped
+
+
+def _roi_view_generator():
+    """Stream the camera frame warped through the ROI polygon. Idle when no
+    polygon is defined or `enabled = false`; the UI hides the <img> in
+    those cases so the connection sits without doing real work."""
+    boundary = b"--frame\r\n"
+    placeholder_emitted = False
+    while True:
+        cam = state.camera
+        roi = state.camera_roi
+        active = (
+            cam is not None
+            and roi is not None
+            and roi.enabled
+            and len(roi.corners) == 4
+        )
+        if not active:
+            if not placeholder_emitted:
+                ok, png = cv2.imencode(".jpg", np.zeros((1, 1, 3), dtype=np.uint8))
+                if ok:
+                    yield boundary + b"Content-Type: image/jpeg\r\n\r\n" + png.tobytes() + b"\r\n"
+                placeholder_emitted = True
+            time.sleep(0.2)
+            continue
+        placeholder_emitted = False
+        latest = cam.read_latest()
+        if latest is None:
+            time.sleep(0.05)
+            continue
+        frame, _ts = latest
+        warped = _warp_camera_roi(frame, roi)
+        if warped is None:
+            time.sleep(0.05)
+            continue
+        ok, jpeg = cv2.imencode(".jpg", warped, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        if not ok:
+            time.sleep(0.05)
+            continue
+        yield boundary + b"Content-Type: image/jpeg\r\n\r\n" + jpeg.tobytes() + b"\r\n"
+        time.sleep(0.05)
+
+
+@app.get("/camera/roi_view.mjpg")
+async def camera_roi_view():
+    return StreamingResponse(
+        _roi_view_generator(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
 @app.get("/markers/{marker_id}.png")
 async def marker_png(marker_id: int) -> Response:
     """Marker PNG with a white quiet zone around it.
@@ -814,6 +958,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 show_work_surface_outline=state.show_work_surface_outline,
                 camera_index=state.camera_index,
                 camera_open=state.camera is not None,
+                camera_roi=state.camera_roi,
             ).model_dump(mode="json")
         )
         while True:
@@ -840,6 +985,16 @@ async def ws_endpoint(ws: WebSocket) -> None:
             elif mtype == "set_camera":
                 idx = msg.get("index")
                 await state.set_camera(int(idx) if idx is not None else None)
+            elif mtype == "set_camera_roi":
+                raw_enabled = msg.get("enabled")
+                enabled = (
+                    bool(raw_enabled) if raw_enabled is not None else None
+                )
+                await state.set_camera_roi(
+                    msg.get("corners", []),
+                    bool(msg.get("clear", False)),
+                    enabled,
+                )
             else:
                 log.warning("unknown command type: %s", mtype)
     except WebSocketDisconnect:

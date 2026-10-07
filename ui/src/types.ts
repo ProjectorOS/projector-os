@@ -40,6 +40,17 @@ export interface WorkSurface {
   updated_at: number;
 }
 
+export interface CameraRoi {
+  // 4 [x, y] cam-pixel corners in TL/TR/BR/BL order. Stored purely as a
+  // user annotation for now; no server-side consumer yet.
+  corners: [number, number][];
+  // When false, the polygon is hidden in the camera card and any future
+  // consumer should treat the ROI as off. The corners are preserved on
+  // disk so toggling back on restores them.
+  enabled: boolean;
+  updated_at: number;
+}
+
 export type ServerEvent =
   | {
       type: "hello";
@@ -50,6 +61,7 @@ export type ServerEvent =
       show_work_surface_outline: boolean;
       camera_index: number | null;
       camera_open: boolean;
+      camera_roi: CameraRoi | null;
     }
   | { type: "mode_changed"; mode: Mode }
   | { type: "detections"; objects: DetectedObject[]; ts: number }
@@ -67,6 +79,7 @@ export type ServerEvent =
   | { type: "projector_registered"; proj_width: number; proj_height: number }
   | { type: "work_surface_updated"; work_surface: WorkSurface; show_outline: boolean }
   | { type: "camera_changed"; camera_index: number | null; camera_open: boolean; error: string | null }
+  | { type: "camera_roi_updated"; camera_roi: CameraRoi | null }
   | {
       type: "frame_stats";
       mode: Mode;
@@ -91,4 +104,13 @@ export type ClientCommand =
       height: number;
       show_outline?: boolean;
     }
-  | { type: "set_camera"; index: number | null };
+  | { type: "set_camera"; index: number | null }
+  | {
+      type: "set_camera_roi";
+      // 4 [x, y] cam-pixel corners (TL/TR/BR/BL). Ignored when clear=true.
+      corners: [number, number][];
+      clear?: boolean;
+      // Toggle visibility flag; when omitted, the server preserves the
+      // existing value (or defaults to true for newly-defined polygons).
+      enabled?: boolean;
+    };

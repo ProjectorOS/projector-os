@@ -53,6 +53,26 @@ class WorkSurface(BaseModel):
     updated_at: float
 
 
+class CameraRoi(BaseModel):
+    """User-defined region of interest on the camera frame.
+
+    `corners` is a 4-point polygon in cam_px (TL/TR/BR/BL order). Stored
+    purely as an annotation for now — no server-side consumer; future
+    features (keystone correction, masking) can pick it up.
+
+    `enabled` lets the user hide the polygon overlay (and signal "ignore
+    this ROI" to future consumers) without losing the saved corners. The
+    polygon is preserved on disk regardless; only the enabled flag flips.
+    """
+
+    corners: list[list[float]] = Field(
+        default_factory=list,
+        description="4 [x, y] cam-pixel points in TL/TR/BR/BL order.",
+    )
+    enabled: bool = True
+    updated_at: float
+
+
 class HelloEvent(BaseModel):
     type: Literal["hello"] = "hello"
     mode: Mode
@@ -62,6 +82,7 @@ class HelloEvent(BaseModel):
     show_work_surface_outline: bool = True
     camera_index: int | None = None
     camera_open: bool = False
+    camera_roi: CameraRoi | None = None
 
 
 class ModeChangedEvent(BaseModel):
@@ -131,6 +152,14 @@ class CameraChangedEvent(BaseModel):
     error: str | None = None
 
 
+class CameraRoiUpdatedEvent(BaseModel):
+    """Broadcast whenever the user-defined camera-frame ROI polygon changes
+    (set, edited, or cleared). `camera_roi` is null when cleared."""
+
+    type: Literal["camera_roi_updated"] = "camera_roi_updated"
+    camera_roi: CameraRoi | None
+
+
 class FrameStatsEvent(BaseModel):
     """Heartbeat broadcast at ~1 Hz so the UI can show that the frame loop is alive
     and how it's doing (FPS, frame index, last frame age). Fires regardless of mode
@@ -157,6 +186,7 @@ ServerEvent = Union[
     ProjectorRegisteredEvent,
     WorkSurfaceUpdatedEvent,
     CameraChangedEvent,
+    CameraRoiUpdatedEvent,
     FrameStatsEvent,
 ]
 
@@ -205,6 +235,23 @@ class SetCameraCommand(BaseModel):
     index: int | None
 
 
+class SetCameraRoiCommand(BaseModel):
+    """Set, clear, or toggle visibility of the user-defined camera-frame
+    ROI polygon.
+
+    - `clear=True` — remove the polygon and delete the persistence file.
+    - `corners` (4 points, TL/TR/BR/BL) — replace the saved polygon.
+    - `enabled` — flip the visibility flag without changing the corners.
+      Sent alone (no `corners`, `clear=False`) when the user clicks the
+      Show/Hide ROI toggle.
+    """
+
+    type: Literal["set_camera_roi"] = "set_camera_roi"
+    corners: list[list[float]] = Field(default_factory=list)
+    clear: bool = False
+    enabled: bool | None = None
+
+
 ClientCommand = Union[
     SetModeCommand,
     RegisterProjectorCommand,
@@ -212,4 +259,5 @@ ClientCommand = Union[
     FinishCalibrationCommand,
     SetWorkSurfaceCommand,
     SetCameraCommand,
+    SetCameraRoiCommand,
 ]

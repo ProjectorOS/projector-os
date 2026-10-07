@@ -13,6 +13,7 @@ dist/
 data/calibration.json
 data/work_surface.json
 data/preferences.json
+data/camera_roi.json
 data/*.png
 data/*.jpg
 data/models/
