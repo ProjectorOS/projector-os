@@ -805,6 +805,105 @@ async def camera_preview():
     )
 
 
+def _warp_camera_roi(frame: np.ndarray, roi: CameraRoi) -> np.ndarray | None:
+    """Project the camera frame through H_polygon→rectangle so the ROI's
+    4 corners map to the corners of an output image. The output dimensions
+    are the average of opposite edge lengths so the polygon's apparent
+    aspect ratio is preserved.
+
+    Returns None when the polygon is too small, malformed, or
+    cv2.getPerspectiveTransform fails.
+    """
+    if frame is None or frame.size == 0:
+        return None
+    corners = np.array(roi.corners, dtype=np.float32)
+    if corners.shape != (4, 2):
+        return None
+    tl, tr, br, bl = corners
+    top_w = float(np.linalg.norm(tr - tl))
+    bot_w = float(np.linalg.norm(br - bl))
+    left_h = float(np.linalg.norm(bl - tl))
+    right_h = float(np.linalg.norm(br - tr))
+    out_w = int(round((top_w + bot_w) / 2.0))
+    out_h = int(round((left_h + right_h) / 2.0))
+    if out_w < 50 or out_h < 50:
+        return None
+    # Cap output size so warping a tiny polygon to a huge rectangle doesn't
+    # cost gigabytes of pixels. 2000 px on the long side is plenty for a
+    # preview <img>.
+    cap = 2000
+    if max(out_w, out_h) > cap:
+        scale = cap / max(out_w, out_h)
+        out_w = max(50, int(round(out_w * scale)))
+        out_h = max(50, int(round(out_h * scale)))
+    target = np.array(
+        [[0, 0], [out_w, 0], [out_w, out_h], [0, out_h]],
+        dtype=np.float32,
+    )
+    try:
+        h_mat = cv2.getPerspectiveTransform(corners, target)
+        warped = cv2.warpPerspective(
+            frame,
+            h_mat,
+            (out_w, out_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(0, 0, 0),
+        )
+    except cv2.error:
+        return None
+    return warped
+
+
+def _roi_view_generator():
+    """Stream the camera frame warped through the ROI polygon. Idle when no
+    polygon is defined or `enabled = false`; the UI hides the <img> in
+    those cases so the connection sits without doing real work."""
+    boundary = b"--frame\r\n"
+    placeholder_emitted = False
+    while True:
+        cam = state.camera
+        roi = state.camera_roi
+        active = (
+            cam is not None
+            and roi is not None
+            and roi.enabled
+            and len(roi.corners) == 4
+        )
+        if not active:
+            if not placeholder_emitted:
+                ok, png = cv2.imencode(".jpg", np.zeros((1, 1, 3), dtype=np.uint8))
+                if ok:
+                    yield boundary + b"Content-Type: image/jpeg\r\n\r\n" + png.tobytes() + b"\r\n"
+                placeholder_emitted = True
+            time.sleep(0.2)
+            continue
+        placeholder_emitted = False
+        latest = cam.read_latest()
+        if latest is None:
+            time.sleep(0.05)
+            continue
+        frame, _ts = latest
+        warped = _warp_camera_roi(frame, roi)
+        if warped is None:
+            time.sleep(0.05)
+            continue
+        ok, jpeg = cv2.imencode(".jpg", warped, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        if not ok:
+            time.sleep(0.05)
+            continue
+        yield boundary + b"Content-Type: image/jpeg\r\n\r\n" + jpeg.tobytes() + b"\r\n"
+        time.sleep(0.05)
+
+
+@app.get("/camera/roi_view.mjpg")
+async def camera_roi_view():
+    return StreamingResponse(
+        _roi_view_generator(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
 @app.get("/markers/{marker_id}.png")
 async def marker_png(marker_id: int) -> Response:
     """Marker PNG with a white quiet zone around it.

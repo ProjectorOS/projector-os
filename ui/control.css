@@ -362,18 +362,17 @@ input[type="text"][data-role="measurement-input"] {
   transform-origin: center;
 }
 
-/* Camera preview + magnifier row. The row gets an explicit height so the
-   magnifier's `height: 100%` is anchored to a definite value — without
-   that, `aspect-ratio: 1` on the magnifier would override the otherwise-
-   working `align-self: stretch` (per CSS Sizing 4) and the magnifier would
-   collapse back to its intrinsic content size. */
+/* Camera preview + magnifier row. The right column is a vertical stack:
+   live camera preview on top, warped ROI preview directly below with a
+   1em gap. The magnifier on the left is sized to match just the camera
+   preview's height (not the entire stack), so adding the ROI preview
+   doesn't blow the magnifier up to 720+px. */
 .cam-preview-row {
   display: flex;
   gap: 12px;
-  align-items: stretch;
+  align-items: flex-start;
   flex-wrap: wrap;
   margin: 10px 0 12px;
-  height: 360px;
 }
 /* Author `display: flex` above wins over the user-agent `[hidden] {
    display: none }` rule (same specificity, author > UA), so we need an
@@ -381,25 +380,39 @@ input[type="text"][data-role="measurement-input"] {
 .cam-preview-row[hidden] {
   display: none;
 }
-.cam-preview-row .calib-preview {
+.cam-preview-stack {
   flex: 1 1 280px;
   min-width: 0;
-  margin: 0;
-  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 1em;
 }
-.cam-preview-row .calib-preview img {
-  /* In the row layout we want the image to fill the fixed-height row so
-     the magnifier next to it has a stable height to anchor on. */
+.cam-preview-stack .calib-preview {
+  margin: 0;
+  /* The live preview keeps a fixed height so the magnifier next to it
+     has a stable square anchor; the warped ROI preview below is content-
+     sized (its aspect ratio depends on the polygon). */
+  height: auto;
+}
+.cam-preview-stack [data-role="cam-preview"] {
+  height: 360px;
+}
+.cam-preview-stack [data-role="cam-preview"] img {
   height: 100%;
   max-height: none;
 }
+.cam-preview-stack [data-role="cam-roi-view"] img {
+  /* Cap the warped preview so a tall polygon doesn't push the page. */
+  max-height: 360px;
+}
 
-/* Cursor magnifier: square. The container's height is 100% of the parent
-   row (definite, see above), and aspect-ratio: 1 makes width match height. */
+/* Cursor magnifier: square, anchored to the live camera preview's 360 px
+   height (not the whole stack — otherwise it'd grow when the ROI preview
+   appears). */
 .cam-magnifier {
   flex: 0 0 auto;
-  height: 100%;
-  width: auto;
+  height: 360px;
+  width: 360px;
   aspect-ratio: 1;
   background: #000;
   border: 1px solid var(--panel-border);

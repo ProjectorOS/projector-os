@@ -135,19 +135,31 @@
                    viewBox="0 0 100 100" preserveAspectRatio="none"
                    xmlns="http://www.w3.org/2000/svg"></svg>
             </div>
-            <div class="calib-preview" data-role="cam-preview">
-              <img data-role="cam-preview-img" alt="Camera preview" />
-              <svg class="calib-overlay" data-role="marker-overlay"
-                   preserveAspectRatio="xMidYMid meet"
-                   xmlns="http://www.w3.org/2000/svg" hidden></svg>
-              <!-- ROI polygon overlay: dim mask outside the polygon, cyan
-                   outline + 4 draggable corner handles. preserveAspectRatio
-                   matches the <img>'s `object-fit: contain` so the overlay
-                   aligns pixel-for-pixel with the camera frame. -->
-              <svg class="calib-overlay calib-overlay-interactive"
-                   data-role="camera-roi-overlay"
-                   preserveAspectRatio="xMidYMid meet"
-                   xmlns="http://www.w3.org/2000/svg" hidden></svg>
+            <!-- Right column of the preview row: the live camera image on top,
+                 and (when an ROI is in effect) the warped ROI preview directly
+                 below it with a 1em gap. -->
+            <div class="cam-preview-stack">
+              <div class="calib-preview" data-role="cam-preview">
+                <img data-role="cam-preview-img" alt="Camera preview" />
+                <svg class="calib-overlay" data-role="marker-overlay"
+                     preserveAspectRatio="xMidYMid meet"
+                     xmlns="http://www.w3.org/2000/svg" hidden></svg>
+                <!-- ROI polygon overlay: dim mask outside the polygon, cyan
+                     outline + 4 draggable corner handles. preserveAspectRatio
+                     matches the <img>'s `object-fit: contain` so the overlay
+                     aligns pixel-for-pixel with the camera frame. -->
+                <svg class="calib-overlay calib-overlay-interactive"
+                     data-role="camera-roi-overlay"
+                     preserveAspectRatio="xMidYMid meet"
+                     xmlns="http://www.w3.org/2000/svg" hidden></svg>
+              </div>
+              <!-- Resulting frame: the camera image warped so the ROI polygon
+                   maps to a rectangle. Shown only when an ROI is defined and
+                   enabled, so the user can see what's "inside" the polygon
+                   flattened into a normal-looking image. -->
+              <div class="calib-preview" data-role="cam-roi-view" hidden>
+                <img data-role="cam-roi-view-img" alt="ROI view" />
+              </div>
             </div>
           </div>
           <div class="row">

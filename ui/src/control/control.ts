@@ -126,6 +126,9 @@ class ControlApp {
   // Whether the camera <img> currently has its MJPEG src attribute set. Used to avoid
   // restarting the long-lived multipart HTTP connection on every render.
   private cameraPreviewActive = false;
+  // Same idea for the warped ROI-view stream — toggled when the ROI is
+  // defined + enabled, off otherwise.
+  private roiViewActive = false;
   // The user's typed measurement, kept here so we can pre-fill from a saved
   // calibration without forcing a render.
   private pendingMm = "";
@@ -690,6 +693,25 @@ class ControlApp {
       : "Edit ROI";
     if (roiVisible) this.updateCameraRoiOverlay();
     this.applyCameraRoiControls();
+
+    // Warped ROI view: visible whenever an ROI is in effect (defined +
+    // enabled), regardless of edit mode. Mirrors the cameraPreviewActive
+    // pattern so we don't reopen the MJPEG connection on every render.
+    const roiInEffect =
+      live &&
+      roi !== null &&
+      roi.corners.length === 4 &&
+      roi.enabled;
+    const roiViewWrap = q("cam-roi-view");
+    roiViewWrap.hidden = !roiInEffect;
+    const roiViewImg = q<HTMLImageElement>("cam-roi-view-img");
+    if (roiInEffect && !this.roiViewActive) {
+      roiViewImg.src = `${SERVER_HTTP}/camera/roi_view.mjpg`;
+      this.roiViewActive = true;
+    } else if (!roiInEffect && this.roiViewActive) {
+      roiViewImg.removeAttribute("src");
+      this.roiViewActive = false;
+    }
 
     const errorNode = q("camera-error");
     if (this.state.cameraError) {
@@ -1521,7 +1543,11 @@ class ControlApp {
     );
 
     let lastSentAt = 0;
-    const SEND_INTERVAL_MS = 80;
+    // 30 Hz keeps the warped ROI MJPEG preview moving in lockstep with the
+    // dragged corner — the stream's own frame cadence is ~20 Hz, so this
+    // ensures every emitted frame sees the latest polygon. Same shape as
+    // the work-surface drag throttle above.
+    const SEND_INTERVAL_MS = 33;
 
     const onMove = (e: PointerEvent): void => {
       const dx = (e.clientX - startClientX) * inv;
